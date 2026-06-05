@@ -18,11 +18,17 @@ from core.validator   import validate_file
 from core.session_mgr import create_session, save_uploaded_file, cleanup_old_sessions
 from core.ingestor    import get_or_create_connection, load_file_into_duckdb, get_all_tables
 from core.transformer import clean_and_profile
+from core.session_mgr import start_cleanup_daemon
+from core import nl2sql
+import os
+import re
+from config import PROMPT_MAX_LENGTH
 
 
 st.set_page_config(page_title="Analytics App", page_icon="📊", layout="wide")
 
 cleanup_old_sessions()
+start_cleanup_daemon()
 
 # ── Session state defaults ────────────────────
 if "session_id"      not in st.session_state: st.session_state.session_id      = None
@@ -165,4 +171,34 @@ if conn and tables:
         "\n\n🚧 NL → SQL pipeline coming next."
     )
     if prompt.strip():
-        st.code(f"-- Your prompt will generate SQL like:\nSELECT * FROM {tables[0]} LIMIT 10;")
+        # Prompt length validation
+        if len(prompt) > PROMPT_MAX_LENGTH:
+            st.error(f"Prompt is too long (max {PROMPT_MAX_LENGTH} characters). Please shorten it.")
+        else:
+            # Build / call NL→SQL. We prefer using OPENAI_API_KEY from env if present.
+            api_key = os.environ.get("OPENAI_API_KEY")
+            sql, llm_prompt, used = nl2sql.generate_sql_from_prompt(
+                conn, tables[0], prompt, redact=False, max_prompt_length=PROMPT_MAX_LENGTH, openai_api_key=api_key
+            )
+
+            if not used:
+                st.code("-- LLM not configured or prompt exceeds limit. Preview of constructed prompt:\n" + llm_prompt)
+                st.info(f"Constructed prompt length: {len(llm_prompt)} chars")
+            else:
+                if sql is None:
+                    st.error("LLM did not return a valid SQL statement. See prompt/response for details.")
+                    st.code(llm_prompt)
+                else:
+                    # Simple safety check: only allow read-only queries (SELECT / WITH)
+                    if not re.match(r"^\s*(SELECT|WITH)\b", sql, flags=re.I):
+                        st.error("Generated SQL appears to be non-read-only. Will not execute for safety.")
+                        st.code(sql)
+                    else:
+                        st.subheader("🔎 Generated SQL")
+                        st.code(sql)
+                        try:
+                            df = conn.execute(sql).df()
+                            st.subheader("📋 Query result (first 50 rows)")
+                            st.dataframe(df.head(50), use_container_width=True)
+                        except Exception as e:
+                            st.error(f"Could not execute generated SQL: {e}")

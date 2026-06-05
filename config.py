@@ -26,3 +26,10 @@ ALLOWED_MIME_TYPES = {
 
 # Where we store temp session folders on the server
 TMP_BASE_DIR = "/tmp/analytics_sessions"
+
+# Max allowed prompt length (characters) for NL→SQL requests
+PROMPT_MAX_LENGTH = 2000
+
+# When building a DDL for the LLM, if a table has more than this many
+# columns we'll compress/summarise the schema for privacy and token cost.
+DDL_MAX_COLUMNS = 50

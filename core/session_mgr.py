@@ -12,8 +12,12 @@ import uuid
 import shutil
 import time
 import os
+import threading
 from pathlib import Path
 from config import TMP_BASE_DIR, SESSION_TTL_MINUTES
+
+# Internal flag to ensure the background cleanup daemon is started only once
+_cleanup_daemon_started = False
 
 
 def create_session() -> tuple[str, Path]:
@@ -72,6 +76,31 @@ def cleanup_old_sessions() -> list[str]:
             _try_delete(session_dir, failures)
 
     return failures
+
+
+def start_cleanup_daemon(interval_seconds: int = 60):
+    """
+    Start a background daemon thread that periodically calls
+    `cleanup_old_sessions()` to remove idle session folders.
+
+    This is safe to call multiple times; the daemon will only be
+    started once per process.
+    """
+    global _cleanup_daemon_started
+    if _cleanup_daemon_started:
+        return
+
+    def _loop():
+        while True:
+            try:
+                cleanup_old_sessions()
+            except Exception:
+                pass
+            time.sleep(interval_seconds)
+
+    t = threading.Thread(target=_loop, daemon=True, name="session_cleanup")
+    t.start()
+    _cleanup_daemon_started = True
 
 
 # ── Private helpers ───────────────────────────
