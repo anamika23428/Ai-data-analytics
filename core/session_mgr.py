@@ -1,76 +1,95 @@
 # ─────────────────────────────────────────────
 #  core/session_mgr.py  –  Temp folder management
 #
-#  Every user gets their own private folder under /tmp/
-#  so their files never mix with anyone else's.
-#
-#  Folders are cleaned up automatically after the TTL
-#  (30 minutes by default) has passed.
+#  Fixes:
+#    1. TTL now based on last-accessed time, not creation time
+#       so active sessions are never deleted mid-use
+#    2. Windows PermissionError on rmtree is now surfaced as a warning
+#       instead of silently swallowed
 # ─────────────────────────────────────────────
 
 import uuid
 import shutil
 import time
+import os
 from pathlib import Path
 from config import TMP_BASE_DIR, SESSION_TTL_MINUTES
 
 
 def create_session() -> tuple[str, Path]:
-    """
-    Create a new session:
-      - Generate a unique session ID
-      - Create a private folder for this session at /tmp/analytics_sessions/<session_id>/
-      - Return (session_id, folder_path)
-    """
-    session_id = str(uuid.uuid4())          # e.g. "3f2a1b4c-..."
+    """Create a new private session folder. Returns (session_id, folder_path)."""
+    session_id  = str(uuid.uuid4())
     session_dir = Path(TMP_BASE_DIR) / session_id
     session_dir.mkdir(parents=True, exist_ok=True)
-
-    # Write a small timestamp file so we know when this session started
-    (session_dir / ".created_at").write_text(str(time.time()))
-
+    _touch_session(session_dir)   # write initial timestamp
     return session_id, session_dir
 
 
 def get_session_dir(session_id: str) -> Path | None:
-    """
-    Look up an existing session folder.
-    Returns the Path if it exists, or None if it has been deleted / never existed.
-    """
     session_dir = Path(TMP_BASE_DIR) / session_id
-    return session_dir if session_dir.exists() else None
+    if session_dir.exists():
+        _touch_session(session_dir)   # update last-accessed time on every lookup
+        return session_dir
+    return None
 
 
 def save_uploaded_file(session_dir: Path, uploaded_file) -> Path:
-    """
-    Write the uploaded Streamlit file to the session folder on disk.
-    Returns the path to the saved file.
-    """
+    """Save the uploaded Streamlit file to disk. Returns the saved path."""
     destination = session_dir / uploaded_file.name
     destination.write_bytes(uploaded_file.read())
-    uploaded_file.seek(0)   # rewind in case something else needs to read it
+    uploaded_file.seek(0)
+    _touch_session(session_dir)   # accessing the session — refresh TTL
     return destination
 
 
-def cleanup_old_sessions():
+def cleanup_old_sessions() -> list[str]:
     """
-    Walk through all session folders and delete any that are older
-    than SESSION_TTL_MINUTES.  Call this once at app startup.
+    Delete session folders that have been idle for longer than SESSION_TTL_MINUTES.
+    Uses last-accessed time (not creation time) so active sessions are safe.
+
+    Returns a list of any folders that could NOT be deleted (e.g. Windows lock).
     """
     base = Path(TMP_BASE_DIR)
     if not base.exists():
-        return
+        return []
 
-    cutoff = time.time() - (SESSION_TTL_MINUTES * 60)   # timestamp N minutes ago
+    cutoff   = time.time() - (SESSION_TTL_MINUTES * 60)
+    failures = []
 
     for session_dir in base.iterdir():
-        timestamp_file = session_dir / ".created_at"
-
-        if not timestamp_file.exists():
-            # No timestamp → treat as expired
-            shutil.rmtree(session_dir, ignore_errors=True)
+        if not session_dir.is_dir():
             continue
 
-        created_at = float(timestamp_file.read_text())
-        if created_at < cutoff:
-            shutil.rmtree(session_dir, ignore_errors=True)
+        timestamp_file = session_dir / ".last_accessed"
+
+        # No timestamp file → treat as expired
+        if not timestamp_file.exists():
+            _try_delete(session_dir, failures)
+            continue
+
+        last_accessed = float(timestamp_file.read_text())
+        if last_accessed < cutoff:
+            _try_delete(session_dir, failures)
+
+    return failures
+
+
+# ── Private helpers ───────────────────────────
+
+def _touch_session(session_dir: Path):
+    """Write the current timestamp as the last-accessed marker."""
+    (session_dir / ".last_accessed").write_text(str(time.time()))
+
+
+def _try_delete(session_dir: Path, failures: list[str]):
+    """
+    Try to delete a session folder.
+    On Windows, DuckDB may still hold file handles open → catches PermissionError
+    and records the path in failures instead of silently ignoring it.
+    """
+    try:
+        shutil.rmtree(session_dir)
+    except PermissionError:
+        failures.append(str(session_dir))   # caller can log or warn the user
+    except Exception:
+        failures.append(str(session_dir))

@@ -1,84 +1,133 @@
 # ─────────────────────────────────────────────
-#  core/ingestor.py  –  "How do we read this file?"
+#  core/ingestor.py
 #
-#  Router logic:
-#    CSV / JSON / TXT  →  DuckDB reads directly
-#    XLSX              →  openpyxl converts to DataFrame first,
-#                         then we hand it to DuckDB
-#
-#  Either way, the output is always a DuckDB connection
-#  with a table called  "data"  ready to query.
+#  Fixes:
+#    1. Duplicate table names across files → warn instead of silent overwrite
+#    2. File paths with spaces → use $$ quoting in SQL
 # ─────────────────────────────────────────────
 
+import re
 from pathlib import Path
 import duckdb
-import pandas as pd
 import openpyxl
 
 
-def load_file_into_duckdb(file_path: Path) -> duckdb.DuckDBPyConnection:
-    """
-    Read a file and load it into an in-memory DuckDB table called "data".
+def get_or_create_connection(session_state) -> duckdb.DuckDBPyConnection:
+    """Return the shared DuckDB connection, installing excel extension only once."""
+    if "duckdb_conn" not in session_state or session_state.duckdb_conn is None:
+        conn = duckdb.connect()
+        conn.execute("INSTALL excel")
+        conn.execute("LOAD excel")
+        session_state.duckdb_conn = conn
+    return session_state.duckdb_conn
 
-    Returns a DuckDB connection so the caller can run SQL on it.
+
+def load_file_into_duckdb(
+    file_path: Path,
+    conn: duckdb.DuckDBPyConnection,
+    existing_tables: list[str]
+) -> tuple[list[str], list[str]]:
     """
-    suffix = file_path.suffix.lower()
-    conn = duckdb.connect()   # fresh in-memory database
+    Read a file and create one DuckDB table per dataset.
+
+    Returns:
+        (created_tables, warnings)
+        warnings is a list of human-readable messages about name conflicts.
+    """
+    suffix   = file_path.suffix.lower()
+    warnings = []
 
     if suffix in (".csv", ".txt"):
-        _load_csv(conn, file_path)
-
+        tables = [_load_csv(conn, file_path, existing_tables, warnings)]
     elif suffix == ".json":
-        _load_json(conn, file_path)
-
+        tables = [_load_json(conn, file_path, existing_tables, warnings)]
     elif suffix == ".xlsx":
-        _load_excel(conn, file_path)
-
+        tables = _load_excel_all_sheets(conn, file_path, existing_tables, warnings)
     else:
         raise ValueError(f"Unsupported file type: {suffix}")
 
-    return conn
+    return tables, warnings
 
 
-# ── Private helpers ───────────────────────────────────────
+def get_all_tables(conn: duckdb.DuckDBPyConnection) -> list[str]:
+    result = conn.execute("SHOW TABLES").fetchall()
+    return [row[0] for row in result]
 
-def _load_csv(conn: duckdb.DuckDBPyConnection, file_path: Path):
+
+# ── Private helpers ───────────────────────────
+
+def _safe_path(file_path: Path) -> str:
     """
-    DuckDB can read CSV and TXT files natively with read_csv_auto().
-    It figures out column names, separators, and types on its own.
+    Wrap path in $$ so spaces and special characters don't break SQL.
+    E.g.  C:/my files/data.csv  →  $$C:/my files/data.csv$$
     """
-    sql = f"CREATE TABLE data AS SELECT * FROM read_csv_auto('{file_path}', header=true)"
-    conn.execute(sql)
+    return f"$${file_path}$$"
 
 
-def _load_json(conn: duckdb.DuckDBPyConnection, file_path: Path):
+def _resolve_table_name(
+    raw_name: str,
+    existing_tables: list[str],
+    warnings: list[str]
+) -> str:
     """
-    DuckDB can read JSON files natively with read_json_auto().
-    Works for both JSON arrays and newline-delimited JSON.
+    Generate a table name and check for conflicts.
+    If the name already exists, append _2, _3 etc. and add a warning.
     """
-    sql = f"CREATE TABLE data AS SELECT * FROM read_json_auto('{file_path}')"
-    conn.execute(sql)
+    base = _make_table_name(raw_name)
+    name = base
+    counter = 2
+
+    while name in existing_tables:
+        warnings.append(
+            f"⚠️ Table `{name}` already exists. "
+            f"Renaming new table to `{base}_{counter}` to avoid overwrite."
+        )
+        name = f"{base}_{counter}"
+        counter += 1
+
+    existing_tables.append(name)  # register immediately so next file sees it
+    return name
 
 
-def _load_excel(conn: duckdb.DuckDBPyConnection, file_path: Path):
-    """
-    DuckDB doesn't speak XLSX, so we use openpyxl to open the workbook,
-    turn the first sheet into a pandas DataFrame, then hand that
-    DataFrame to DuckDB as a virtual table.
-    """
-    workbook = openpyxl.load_workbook(file_path, data_only=True)
-    sheet    = workbook.active                         # first / active sheet
+def _load_csv(conn, file_path, existing_tables, warnings):
+    table_name = _resolve_table_name(file_path.stem, existing_tables, warnings)
+    conn.execute(f"""
+        CREATE OR REPLACE TABLE {table_name} AS
+        SELECT * FROM read_csv_auto({_safe_path(file_path)}, header=true)
+    """)
+    return table_name
 
-    # Pull all rows out of the sheet
-    rows = list(sheet.iter_rows(values_only=True))
 
-    if not rows:
-        raise ValueError("The Excel file appears to be empty.")
+def _load_json(conn, file_path, existing_tables, warnings):
+    table_name = _resolve_table_name(file_path.stem, existing_tables, warnings)
+    conn.execute(f"""
+        CREATE OR REPLACE TABLE {table_name} AS
+        SELECT * FROM read_json_auto({_safe_path(file_path)})
+    """)
+    return table_name
 
-    headers = [str(cell) if cell is not None else f"col_{i}"
-               for i, cell in enumerate(rows[0])]
 
-    df = pd.DataFrame(rows[1:], columns=headers)      # row 0 = headers
+def _load_excel_all_sheets(conn, file_path, existing_tables, warnings):
+    wb          = openpyxl.load_workbook(file_path, read_only=True)
+    sheet_names = wb.sheetnames
+    wb.close()
 
-    # Register the DataFrame with DuckDB so we can query it like a table
-    conn.register("data", df)
+    created = []
+    for sheet in sheet_names:
+        table_name = _resolve_table_name(sheet, existing_tables, warnings)
+        conn.execute(f"""
+            CREATE OR REPLACE TABLE {table_name} AS
+            SELECT * FROM read_xlsx({_safe_path(file_path)}, sheet='{sheet}')
+        """)
+        created.append(table_name)
+
+    return created
+
+
+def _make_table_name(raw_name: str) -> str:
+    name = raw_name.strip().lower()
+    name = re.sub(r"[^a-z0-9]+", "_", name)
+    name = name.strip("_")
+    if name and name[0].isdigit():
+        name = "t_" + name
+    return name or "unnamed_table"
