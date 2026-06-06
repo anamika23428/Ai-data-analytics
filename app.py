@@ -12,9 +12,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 import streamlit as st
+import pandas as pd
+import plotly.express as px
 
 from config import MAX_FILE_SIZE_MB, SESSION_TTL_MINUTES
-from core.validator   import validate_file
+from core.validator import validate_file, validate_sql_query
 from core.session_mgr import create_session, save_uploaded_file, cleanup_old_sessions
 from core.ingestor    import get_or_create_connection, load_file_into_duckdb, get_all_tables
 from core.transformer import clean_and_profile
@@ -37,6 +39,58 @@ if "duckdb_conn"     not in st.session_state: st.session_state.duckdb_conn     =
 if "loaded_tables"   not in st.session_state: st.session_state.loaded_tables   = []
 if "quality_reports" not in st.session_state: st.session_state.quality_reports = {}
 if "processed_files" not in st.session_state: st.session_state.processed_files = set()  # tracks filenames already loaded
+
+
+def _infer_chart_spec(df: pd.DataFrame, question: str) -> tuple[str | None, dict]:
+    if df.empty:
+        return None, {}
+
+    question_lower = question.lower()
+    numeric_cols = [col for col in df.columns if pd.api.types.is_numeric_dtype(df[col])]
+    datetime_cols = [col for col in df.columns if pd.api.types.is_datetime64_any_dtype(df[col])]
+    categorical_cols = [col for col in df.columns if col not in numeric_cols and col not in datetime_cols]
+
+    if datetime_cols and numeric_cols and any(word in question_lower for word in ["trend", "over time", "timeline", "by date", "per day", "per month", "monthly", "daily"]):
+        return "line", {"x": datetime_cols[0], "y": numeric_cols[0], "color": categorical_cols[0] if categorical_cols else None}
+
+    if categorical_cols and numeric_cols:
+        return "bar", {"x": categorical_cols[0], "y": numeric_cols[0]}
+
+    if len(numeric_cols) >= 2:
+        return "scatter", {"x": numeric_cols[0], "y": numeric_cols[1]}
+
+    return None, {}
+
+
+def _render_chart(df: pd.DataFrame, question: str) -> None:
+    chart_kind, spec = _infer_chart_spec(df, question)
+    if not chart_kind or not spec:
+        st.info("No obvious chart mapping was detected for this result.")
+        return
+
+    chart_df = df.copy()
+    if chart_kind == "line" and spec.get("x") in chart_df.columns:
+        chart_df[spec["x"]] = pd.to_datetime(chart_df[spec["x"]], errors="coerce")
+        chart_df = chart_df.dropna(subset=[spec["x"]])
+
+    if chart_kind == "bar":
+        x_col = spec["x"]
+        y_col = spec["y"]
+        chart_df = chart_df[[x_col, y_col]].dropna()
+        chart_df = chart_df.groupby(x_col, as_index=False)[y_col].sum().sort_values(y_col, ascending=False).head(25)
+        fig = px.bar(chart_df, x=x_col, y=y_col, title=f"{y_col} by {x_col}")
+    elif chart_kind == "line":
+        fig = px.line(chart_df, x=spec["x"], y=spec["y"], color=spec.get("color"), title=f"{spec['y']} over {spec['x']}")
+    else:
+        fig = px.scatter(chart_df, x=spec["x"], y=spec["y"], title=f"{spec['y']} vs {spec['x']}")
+
+    st.plotly_chart(fig, use_container_width=True)
+    st.download_button(
+        "Download chart as HTML",
+        data=fig.to_html(include_plotlyjs="cdn").encode("utf-8"),
+        file_name="chart.html",
+        mime="text/html",
+    )
 
 
 # ── Header ────────────────────────────────────
@@ -157,7 +211,9 @@ if conn and tables:
                     st.write("**Text → numeric:**", report["coerced_to_numeric"])
                 null_counts = {k: v for k, v in report.get("null_counts", {}).items() if v > 0}
                 if null_counts:
-                    st.write("**Nulls filled:**", null_counts)
+                    st.write("**Nulls preserved:**", null_counts)
+                if report.get("missing_cells") is not None:
+                    st.write("**Missing cells detected:**", report["missing_cells"])
 
             st.markdown("**Preview (first 50 rows)**")
             preview = conn.execute(f"SELECT * FROM {table_name} LIMIT 50").df()
@@ -168,17 +224,23 @@ if conn and tables:
     st.info(
         "**Tables ready to query:** " +
         "  |  ".join(f"`{t}`" for t in tables) +
-        "\n\n🚧 NL → SQL pipeline coming next."
+        "\n\nThe query assistant can use all loaded tables."
     )
     if prompt.strip():
         # Prompt length validation
         if len(prompt) > PROMPT_MAX_LENGTH:
             st.error(f"Prompt is too long (max {PROMPT_MAX_LENGTH} characters). Please shorten it.")
         else:
-            # Build / call NL→SQL. We prefer using OPENAI_API_KEY from env if present.
+            llm_provider = os.environ.get("LLM_PROVIDER", "ollama")
             api_key = os.environ.get("OPENAI_API_KEY")
             sql, llm_prompt, used = nl2sql.generate_sql_from_prompt(
-                conn, tables[0], prompt, redact=False, max_prompt_length=PROMPT_MAX_LENGTH, openai_api_key=api_key
+                conn,
+                tables,
+                prompt,
+                redact=True,
+                max_prompt_length=PROMPT_MAX_LENGTH,
+                llm_provider=llm_provider,
+                openai_api_key=api_key,
             )
 
             if not used:
@@ -189,9 +251,9 @@ if conn and tables:
                     st.error("LLM did not return a valid SQL statement. See prompt/response for details.")
                     st.code(llm_prompt)
                 else:
-                    # Simple safety check: only allow read-only queries (SELECT / WITH)
-                    if not re.match(r"^\s*(SELECT|WITH)\b", sql, flags=re.I):
-                        st.error("Generated SQL appears to be non-read-only. Will not execute for safety.")
+                    ok, reason = validate_sql_query(conn, sql, tables)
+                    if not ok:
+                        st.error(reason)
                         st.code(sql)
                     else:
                         st.subheader("🔎 Generated SQL")
@@ -200,5 +262,14 @@ if conn and tables:
                             df = conn.execute(sql).df()
                             st.subheader("📋 Query result (first 50 rows)")
                             st.dataframe(df.head(50), use_container_width=True)
+                            st.download_button(
+                                "Download result as CSV",
+                                data=df.to_csv(index=False).encode("utf-8"),
+                                file_name="query_result.csv",
+                                mime="text/csv",
+                            )
+
+                            st.subheader("📈 Visualization")
+                            _render_chart(df, prompt)
                         except Exception as e:
                             st.error(f"Could not execute generated SQL: {e}")

@@ -18,6 +18,7 @@
 import json
 import csv
 import io
+import re
 import filetype
 from pathlib import Path
 from config import MAX_FILE_SIZE_BYTES, ALLOWED_EXTENSIONS
@@ -50,6 +51,16 @@ DANGEROUS_SIGNATURES = [
     (b"\xca\xfe\xba\xbe", "Java class file"),
     (b"\xfe\xed\xfa",  "macOS binary"),
 ]
+
+_READ_ONLY_PREFIX = re.compile(r"^\s*(select|with)\b", re.IGNORECASE)
+_DANGEROUS_SQL_TOKENS = re.compile(
+    r"\b(insert|update|delete|drop|alter|create|replace|attach|detach|copy|pragma|call|execute|vacuum|analyze|transaction|begin|commit|rollback|export|import|install|load)\b",
+    re.IGNORECASE,
+)
+_DANGEROUS_FUNCTIONS = re.compile(
+    r"\b(read_csv_auto|read_csv|read_json_auto|read_json|read_parquet|read_xlsx|write_csv|read_blob|glob|system|shell)\s*\(",
+    re.IGNORECASE,
+)
 
 
 def validate_file(uploaded_file) -> tuple[bool, str]:
@@ -84,6 +95,45 @@ def validate_file(uploaded_file) -> tuple[bool, str]:
 
     # ── Plain text files: run all 4 text checks ───────────────
     return _validate_text_file(file_bytes, suffix, uploaded_file)
+
+
+def validate_sql_query(conn, sql: str, allowed_tables: list[str] | None = None) -> tuple[bool, str]:
+    """
+    Validate generated SQL before execution.
+
+    The query must be a single read-only statement, must not use dangerous
+    functions or DDL/DML tokens, and must parse successfully in DuckDB.
+    """
+    candidate = _normalize_sql(sql)
+    if not candidate:
+        return False, "Generated SQL is empty."
+
+    if not _READ_ONLY_PREFIX.match(candidate):
+        return False, "Only SELECT and WITH queries are allowed."
+
+    statement, remainder = _split_single_statement(candidate)
+    if statement is None or remainder:
+        return False, "Only a single SQL statement is allowed."
+
+    stripped = _strip_sql_comments(statement)
+    if _DANGEROUS_SQL_TOKENS.search(stripped):
+        return False, "Generated SQL contains a disallowed keyword."
+    if _DANGEROUS_FUNCTIONS.search(stripped):
+        return False, "Generated SQL uses a disallowed file or system function."
+
+    if allowed_tables:
+        allowed = {table.lower() for table in allowed_tables}
+        referenced = _extract_table_candidates(stripped)
+        unknown = sorted({name for name in referenced if name.lower() not in allowed})
+        if unknown:
+            return False, f"Generated SQL references unknown table(s): {', '.join(unknown)}"
+
+    try:
+        conn.execute(f"EXPLAIN {statement}")
+    except Exception as exc:
+        return False, f"Generated SQL could not be parsed or validated by DuckDB: {exc}"
+
+    return True, ""
 
 
 # ══════════════════════════════════════════════
@@ -258,3 +308,83 @@ def _check_csv_structure(
             )
 
     return True, ""
+
+
+def _normalize_sql(sql: str) -> str:
+    return sql.strip().strip("\ufeff")
+
+
+def _strip_sql_comments(sql: str) -> str:
+    result = []
+    i = 0
+    in_single = False
+    in_double = False
+    in_line_comment = False
+    in_block_comment = False
+
+    while i < len(sql):
+        char = sql[i]
+        next_char = sql[i + 1] if i + 1 < len(sql) else ""
+
+        if in_line_comment:
+            if char == "\n":
+                in_line_comment = False
+                result.append(char)
+            i += 1
+            continue
+
+        if in_block_comment:
+            if char == "*" and next_char == "/":
+                in_block_comment = False
+                i += 2
+                continue
+            i += 1
+            continue
+
+        if not in_single and not in_double and char == "-" and next_char == "-":
+            in_line_comment = True
+            i += 2
+            continue
+        if not in_single and not in_double and char == "/" and next_char == "*":
+            in_block_comment = True
+            i += 2
+            continue
+
+        if char == "'" and not in_double:
+            in_single = not in_single
+        elif char == '"' and not in_single:
+            in_double = not in_double
+
+        result.append(char)
+        i += 1
+
+    return "".join(result)
+
+
+def _split_single_statement(sql: str) -> tuple[str | None, str]:
+    statement = []
+    in_single = False
+    in_double = False
+
+    for index, char in enumerate(sql):
+        if char == "'" and not in_double:
+            in_single = not in_single
+        elif char == '"' and not in_single:
+            in_double = not in_double
+        elif char == ";" and not in_single and not in_double:
+            remainder = sql[index + 1 :].strip()
+            current = "".join(statement).strip()
+            return current, remainder
+        statement.append(char)
+
+    return "".join(statement).strip(), ""
+
+
+def _extract_table_candidates(sql: str) -> list[str]:
+    pattern = re.compile(r"\b(?:from|join)\s+([a-zA-Z_][\w\.]*)", re.IGNORECASE)
+    names = []
+    for match in pattern.finditer(sql):
+        name = match.group(1).split(".")[-1]
+        if name.lower() not in {"select", "with"}:
+            names.append(name)
+    return names

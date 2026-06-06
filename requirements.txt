@@ -3,3 +3,5 @@ duckdb
 pandas
 openpyxl
 python-magic
+filetype
+plotly

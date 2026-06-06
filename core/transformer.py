@@ -3,7 +3,8 @@
 #
 #  Fixes:
 #    1. Duplicate column names after sanitise → deduplicate with suffix
-#    2. SELECT DISTINCT * fails on LIST/STRUCT → fallback to ROW_NUMBER dedup
+#    2. SELECT DISTINCT * fails on LIST/STRUCT → keep original rows
+#    3. Missing values are reported, not silently imputed
 # ─────────────────────────────────────────────
 
 import re
@@ -17,26 +18,16 @@ def clean_and_profile(conn: duckdb.DuckDBPyConnection, table_name: str) -> dict:
     original_rows = conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
 
     # ── Step 2: Deduplicate inside DuckDB ─────────────────────
-    # SELECT DISTINCT * fails on LIST/STRUCT columns, so we try it
-    # and fall back to ROW_NUMBER() if it errors.
+    # SELECT DISTINCT * fails on LIST/STRUCT columns, so we try it.
+    # If DuckDB cannot deduplicate safely, we keep the original rows.
     duplicates_removed = 0
     try:
         conn.execute(f"CREATE OR REPLACE TABLE {table_name} AS SELECT DISTINCT * FROM {table_name}")
         clean_rows         = conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
         duplicates_removed = original_rows - clean_rows
     except Exception:
-        # Fallback: assign a row number and keep only the first occurrence
-        conn.execute(f"""
-            CREATE OR REPLACE TABLE {table_name} AS
-            SELECT * EXCLUDE (__row_num) FROM (
-                SELECT *, ROW_NUMBER() OVER () AS __row_num FROM {table_name}
-            ) WHERE __row_num = (
-                SELECT MIN(t2.__row_num)
-                FROM (SELECT *, ROW_NUMBER() OVER () AS __row_num FROM {table_name}) t2
-            )
-        """)
-        clean_rows         = conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
-        duplicates_removed = original_rows - clean_rows
+        clean_rows = original_rows
+        duplicates_removed = 0
 
     # ── Step 3: Get column names + types ──────────────────────
     col_info  = conn.execute(f"DESCRIBE {table_name}").fetchall()
@@ -60,16 +51,8 @@ def clean_and_profile(conn: duckdb.DuckDBPyConnection, table_name: str) -> dict:
     null_row    = conn.execute(f"SELECT {null_count_sql} FROM {table_name}").fetchone()
     null_counts = dict(zip(new_columns, null_row))
 
-    # ── Step 6: Fill nulls with type-safe defaults ─────────────
-    fill_parts = []
-    for col, dtype in zip(new_columns, col_types):
-        default = _null_default(dtype)
-        fill_parts.append(f'COALESCE("{col}", {default}) AS "{col}"')
-
-    conn.execute(f"""
-        CREATE OR REPLACE TABLE {table_name} AS
-        SELECT {", ".join(fill_parts)} FROM {table_name}
-    """)
+    # ── Step 6: Keep nulls and report missingness ─────────────
+    total_nulls = sum(null_counts.values())
 
     return {
         "original_rows":      original_rows,
@@ -79,6 +62,8 @@ def clean_and_profile(conn: duckdb.DuckDBPyConnection, table_name: str) -> dict:
         "null_counts":        null_counts,
         "dtypes":             dict(zip(new_columns, col_types)),
         "coerced_to_numeric": [],
+        "missing_cells":      total_nulls,
+        "nulls_preserved":    True,
     }
 
 
@@ -112,27 +97,6 @@ def _sanitise_all_names(columns: list[str]) -> list[str]:
             result.append(name)               # unique — no suffix needed
 
     return result
-
-
-def _null_default(dtype: str) -> str:
-    """
-    Return a SQL literal that matches the column type for COALESCE.
-    DuckDB rejects mixing types (e.g. DATE and 0).
-    """
-    d = dtype.upper()
-    if "VARCHAR" in d or "TEXT" in d or "CHAR" in d or "STRING" in d:
-        return "'unknown'"
-    if "TIMESTAMP" in d:
-        return "TIMESTAMP '1970-01-01 00:00:00'"
-    if "DATE" in d:
-        return "DATE '1970-01-01'"
-    if "TIME" in d:
-        return "TIME '00:00:00'"
-    if "BOOLEAN" in d or "BOOL" in d:
-        return "false"
-    if "FLOAT" in d or "DOUBLE" in d or "REAL" in d or "DECIMAL" in d or "NUMERIC" in d:
-        return "0.0"
-    return "0"
 
 
 def _sanitise_name(name: str) -> str:
