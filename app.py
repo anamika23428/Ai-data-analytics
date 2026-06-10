@@ -84,7 +84,7 @@ def _render_chart(df: pd.DataFrame, question: str) -> None:
     else:
         fig = px.scatter(chart_df, x=spec["x"], y=spec["y"], title=f"{spec['y']} vs {spec['x']}")
 
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
     st.download_button(
         "Download chart as HTML",
         data=fig.to_html(include_plotlyjs="cdn").encode("utf-8"),
@@ -217,7 +217,7 @@ if conn and tables:
 
             st.markdown("**Preview (first 50 rows)**")
             preview = conn.execute(f"SELECT * FROM {table_name} LIMIT 50").df()
-            st.dataframe(preview, use_container_width=True)
+            st.dataframe(preview, width="stretch")
 
     st.divider()
     st.subheader("💬 Query")
@@ -261,7 +261,7 @@ if conn and tables:
                         try:
                             df = conn.execute(sql).df()
                             st.subheader("📋 Query result (first 50 rows)")
-                            st.dataframe(df.head(50), use_container_width=True)
+                            st.dataframe(df.head(50), width="stretch")
                             st.download_button(
                                 "Download result as CSV",
                                 data=df.to_csv(index=False).encode("utf-8"),

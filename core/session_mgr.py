@@ -15,9 +15,24 @@ import os
 import threading
 from pathlib import Path
 from config import TMP_BASE_DIR, SESSION_TTL_MINUTES
+import logging
 
 # Internal flag to ensure the background cleanup daemon is started only once
 _cleanup_daemon_started = False
+
+# Module logger — write cleanup activity to a log file under the session base dir.
+logger = logging.getLogger("core.session_mgr")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    try:
+        Path(TMP_BASE_DIR).mkdir(parents=True, exist_ok=True)
+        log_path = Path(TMP_BASE_DIR) / "session_cleanup.log"
+        fh = logging.FileHandler(log_path, encoding="utf-8")
+        fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        logger.addHandler(fh)
+    except Exception:
+        # If we cannot create the file handler, fall back to default logging
+        logging.basicConfig(level=logging.INFO)
 
 
 def create_session() -> tuple[str, Path]:
@@ -71,9 +86,21 @@ def cleanup_old_sessions() -> list[str]:
             _try_delete(session_dir, failures)
             continue
 
-        last_accessed = float(timestamp_file.read_text())
+        try:
+            last_accessed = float(timestamp_file.read_text())
+        except Exception:
+            # If we can't read/parse the timestamp, treat as expired
+            logger.warning(f"Could not read timestamp for {session_dir}; attempting delete")
+            _try_delete(session_dir, failures)
+            continue
+
         if last_accessed < cutoff:
             _try_delete(session_dir, failures)
+
+    if failures:
+        logger.warning(f"Session cleanup completed with failures: {failures}")
+    else:
+        logger.info("Session cleanup completed; no failures")
 
     return failures
 
@@ -118,7 +145,10 @@ def _try_delete(session_dir: Path, failures: list[str]):
     """
     try:
         shutil.rmtree(session_dir)
+        logger.info(f"Removed session folder: {session_dir}")
     except PermissionError:
         failures.append(str(session_dir))   # caller can log or warn the user
-    except Exception:
+        logger.warning(f"PermissionError removing session folder: {session_dir}")
+    except Exception as e:
         failures.append(str(session_dir))
+        logger.exception(f"Error removing session folder {session_dir}: {e}")
