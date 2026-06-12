@@ -5,3 +5,4 @@ openpyxl
 python-magic
 filetype
 plotly
+sqlglot

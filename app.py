@@ -30,10 +30,21 @@ from core.session_mgr import (
 )
 from core.ingestor    import get_or_create_connection, load_file_into_duckdb, get_all_tables
 from core.transformer import clean_and_profile
-from core import nl2sql
 import os
 import re
+import logging
 from config import PROMPT_MAX_LENGTH
+from core.llm_router import route_query
+from core.ddl_utils import generate_privacy_safe_ddl, generate_multi_table_ddl
+from core.route_a import run as run_route_a
+from config import DDL_MAX_COLUMNS
+
+# ── Logging: route decisions visible in terminal ──
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
+    stream=sys.stdout,
+)
 
 
 st.set_page_config(page_title="Analytics App", page_icon="📊", layout="wide")
@@ -127,6 +138,54 @@ def _infer_chart_spec(df: pd.DataFrame, question: str) -> tuple[str | None, dict
         return "scatter", {"x": numeric_cols[0], "y": numeric_cols[1]}
 
     return None, {}
+
+
+def _render_chart_with_hint(
+    df: pd.DataFrame,
+    question: str,
+    chart_type: str | None,
+    x_col: str | None,
+    y_col: str | None,
+) -> None:
+    """Render a chart using router-provided hints (chart_type, x/y axes)."""
+    if df.empty:
+        st.info("No data to display.")
+        return
+
+    # Validate router-suggested columns actually exist in df
+    if x_col and x_col not in df.columns:
+        x_col = None
+    if y_col and y_col not in df.columns:
+        y_col = None
+
+    # Fall back to inference if hints are incomplete
+    if not x_col or not y_col:
+        _render_chart(df, question)
+        return
+
+    try:
+        if chart_type == "bar":
+            fig = px.bar(df, x=x_col, y=y_col, title=f"{y_col} by {x_col}")
+        elif chart_type == "line":
+            fig = px.line(df, x=x_col, y=y_col, title=f"{y_col} over {x_col}")
+        elif chart_type == "scatter":
+            fig = px.scatter(df, x=x_col, y=y_col, title=f"{y_col} vs {x_col}")
+        elif chart_type == "pie":
+            fig = px.pie(df, names=x_col, values=y_col, title=f"{y_col} distribution")
+        else:
+            _render_chart(df, question)
+            return
+
+        st.plotly_chart(fig, use_container_width=True)
+        st.download_button(
+            "Download chart as HTML",
+            data=fig.to_html(include_plotlyjs="cdn").encode("utf-8"),
+            file_name="chart.html",
+            mime="text/html",
+        )
+    except Exception as e:
+        st.warning(f"Router-guided chart failed ({e}), falling back to auto-detect.")
+        _render_chart(df, question)
 
 
 def _render_chart(df: pd.DataFrame, question: str) -> None:
@@ -334,45 +393,182 @@ if conn and tables:
         if len(prompt) > PROMPT_MAX_LENGTH:
             st.error(f"Prompt is too long (max {PROMPT_MAX_LENGTH} characters). Please shorten it.")
         else:
-            llm_provider = os.environ.get("LLM_PROVIDER", "ollama")
-            api_key      = os.environ.get("OPENAI_API_KEY")
-            sql, llm_prompt, used = nl2sql.generate_sql_from_prompt(
-                conn,
-                tables,
-                prompt,
-                redact=True,
-                max_prompt_length=PROMPT_MAX_LENGTH,
-                llm_provider=llm_provider,
-                openai_api_key=api_key,
+            # ══════════════════════════════════════════
+            #  QUERY ROUTER  (runs before NL→SQL)
+            #  Stage 1: regex keyword (~1ms, zero LLM)
+            #  Stage 2: local Ollama  (data stays local)
+            # ══════════════════════════════════════════
+
+            # Build a privacy-safe DDL covering EVERY loaded table, so the
+            # router can correctly classify questions about any uploaded file.
+            primary_table = tables[0] if tables else ""
+            ddl_for_router = generate_multi_table_ddl(
+                conn, tables, redact=False, max_columns=DDL_MAX_COLUMNS
+            ) if tables else ""
+
+            routing_result = route_query(
+                user_prompt       = prompt,
+                ddl_schema        = ddl_for_router,
+                table_name        = ", ".join(tables) if tables else "",
+                sample_rows       = None,   # No raw rows sent — privacy-safe
+                print_to_terminal = True,   # Prints route decision to terminal
             )
 
-            if not used:
-                st.code("-- LLM not configured or prompt exceeds limit. Preview of constructed prompt:\n" + llm_prompt)
-                st.info(f"Constructed prompt length: {len(llm_prompt)} chars")
-            else:
-                if sql is None:
-                    st.error("LLM did not return a valid SQL statement. See prompt/response for details.")
-                    st.code(llm_prompt)
-                else:
-                    ok, reason = validate_sql_query(conn, sql, tables)
-                    if not ok:
-                        st.error(reason)
-                        st.code(sql)
-                    else:
-                        st.subheader("🔎 Generated SQL")
-                        st.code(sql)
-                        try:
-                            df = conn.execute(sql).df()
-                            st.subheader("📋 Query result (first 50 rows)")
-                            st.dataframe(df.head(50), use_container_width=True)
-                            st.download_button(
-                                "Download result as CSV",
-                                data=df.to_csv(index=False).encode("utf-8"),
-                                file_name="query_result.csv",
-                                mime="text/csv",
-                            )
+            parsed_route = routing_result.get("parsed") or {}
+            route_label  = parsed_route.get("route", "sql_answer")
+            confidence   = parsed_route.get("confidence", "HIGH")
+            chart_hint   = parsed_route.get("chart_type")
+            route_stage  = routing_result.get("stage", "?")
 
-                            st.subheader("📈 Visualization")
-                            _render_chart(df, prompt)
-                        except Exception as e:
-                            st.error(f"Could not execute generated SQL: {e}")
+            # ── Show routing badge in UI ──────────────
+            route_icons = {
+                "visualization": "📊",
+                "sql_answer":    "🔢",
+                "metadata":      "🗂️",
+                "statistical":   "📉",
+                "reasoning":     "💡",
+            }
+            icon = route_icons.get(route_label, "❓")
+            conf_colour = {"HIGH": "🟢", "MEDIUM": "🟡", "LOW": "🔴"}.get(confidence, "⚪")
+
+            with st.expander(f"{icon} Route: **{route_label.upper()}**  {conf_colour} {confidence}  ·  stage={route_stage}", expanded=False):
+                if routing_result.get("success"):
+                    st.json(parsed_route)
+                else:
+                    st.warning(f"Router fallback — defaulting to sql_answer. Error: {routing_result.get('error')}")
+
+            # ── Clarification gate for LOW confidence ─
+            if confidence == "LOW" and routing_result.get("success"):
+                st.warning(
+                    "⚠️ The query router is unsure how to classify this question. "
+                    "It will proceed as **sql_answer** — refine your question if the result looks wrong."
+                )
+
+            # ══════════════════════════════════════════
+            #  Metadata route — answer from DDL directly
+            #  (no SQL needed, no LLM for data queries)
+            # ══════════════════════════════════════════
+            if route_label == "metadata":
+                st.subheader("🗂️ Schema Information")
+                for t in tables:
+                    ddl = generate_privacy_safe_ddl(conn, t, redact=False, max_columns=DDL_MAX_COLUMNS)
+                    with st.expander(f"Table: `{t}`", expanded=True):
+                        st.code(ddl, language="sql")
+                        try:
+                            info = conn.execute(f"DESCRIBE {t}").df()
+                            st.dataframe(info, use_container_width=True)
+                        except Exception:
+                            pass
+
+            elif route_label == "visualization":
+                # ══════════════════════════════════════
+                #  ROUTE A — Full Visualization Pipeline
+                #  Intent → SQL → 3-layer Validation
+                #  → DuckDB Execution → Plotly Chart
+                # ══════════════════════════════════════
+                with st.spinner("🎨 Running Route A visualization pipeline…"):
+                    route_a_result = run_route_a(
+                        conn          = conn,
+                        tables        = tables,
+                        prompt        = prompt,
+                        router_intent = parsed_route,   # pass router hints in
+                    )
+
+                if not route_a_result.success:
+                    st.error(f"Route A failed at stage **{route_a_result.stage_reached}**: {route_a_result.error}")
+
+                    # Show validation log if available
+                    if route_a_result.validation_log:
+                        with st.expander("🔍 Validation log"):
+                            for line in route_a_result.validation_log:
+                                st.text(line)
+
+                    # Show generated SQL even on failure so user can debug
+                    if route_a_result.sql:
+                        with st.expander("🔎 Generated SQL (failed)"):
+                            st.code(route_a_result.sql, language="sql")
+                else:
+                    # ── Intent summary ────────────────────
+                    with st.expander("🧠 Extracted Intent", expanded=False):
+                        st.json(route_a_result.intent)
+
+                    # ── SQL ───────────────────────────────
+                    with st.expander("🔎 Generated SQL", expanded=False):
+                        st.code(route_a_result.sql, language="sql")
+
+                    # ── Validation log ────────────────────
+                    with st.expander("✅ Validation log", expanded=False):
+                        for line in route_a_result.validation_log:
+                            st.text(line)
+
+                    # ── Chart ─────────────────────────────
+                    st.subheader(f"📊 {route_a_result.intent.get('title', 'Visualization')}")
+                    st.plotly_chart(route_a_result.fig, use_container_width=True)
+
+                    # ── Export buttons ────────────────────
+                    col_csv, col_html = st.columns(2)
+                    with col_csv:
+                        st.download_button(
+                            "⬇️ Download data as CSV",
+                            data=route_a_result.df.to_csv(index=False).encode("utf-8"),
+                            file_name="chart_data.csv",
+                            mime="text/csv",
+                        )
+                    with col_html:
+                        st.download_button(
+                            "⬇️ Download chart as HTML",
+                            data=route_a_result.fig.to_html(include_plotlyjs="cdn").encode("utf-8"),
+                            file_name="chart.html",
+                            mime="text/html",
+                        )
+
+                    # ── Raw data table ────────────────────
+                    with st.expander("📋 Raw query result", expanded=False):
+                        st.dataframe(route_a_result.df.head(50), use_container_width=True)
+
+            else:
+                # ══════════════════════════════════════
+                #  All other routes → NL→SQL pipeline
+                #  (sql_answer, statistical, reasoning)
+                # ══════════════════════════════════════
+                llm_provider = os.environ.get("LLM_PROVIDER", "ollama")
+                api_key      = os.environ.get("OPENAI_API_KEY")
+                sql, llm_prompt, used = nl2sql.generate_sql_from_prompt(
+                    conn,
+                    tables,
+                    prompt,
+                    redact=True,
+                    max_prompt_length=PROMPT_MAX_LENGTH,
+                    llm_provider=llm_provider,
+                    openai_api_key=api_key,
+                )
+
+                if not used:
+                    st.code("-- LLM not configured or prompt exceeds limit. Preview of constructed prompt:\n" + llm_prompt)
+                    st.info(f"Constructed prompt length: {len(llm_prompt)} chars")
+                else:
+                    if sql is None:
+                        st.error("LLM did not return a valid SQL statement. See prompt/response for details.")
+                        st.code(llm_prompt)
+                    else:
+                        ok, reason = validate_sql_query(conn, sql, tables)
+                        if not ok:
+                            st.error(reason)
+                            st.code(sql)
+                        else:
+                            st.subheader("🔎 Generated SQL")
+                            st.code(sql)
+                            try:
+                                df = conn.execute(sql).df()
+                                st.subheader("📋 Query result (first 50 rows)")
+                                st.dataframe(df.head(50), use_container_width=True)
+                                st.download_button(
+                                    "Download result as CSV",
+                                    data=df.to_csv(index=False).encode("utf-8"),
+                                    file_name="query_result.csv",
+                                    mime="text/csv",
+                                )
+                                st.subheader("📈 Visualization")
+                                _render_chart(df, prompt)
+                            except Exception as e:
+                                st.error(f"Could not execute generated SQL: {e}")

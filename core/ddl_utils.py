@@ -66,3 +66,21 @@ def generate_privacy_safe_ddl(conn, table_name: str, redact: bool = False, max_c
     lines += [") ;", f"-- Total columns: {n} (head {head_count} + middle {len(middle)} + tail {tail_count})"]
 
     return "\n".join(lines)
+
+
+def generate_multi_table_ddl(conn, table_names: List[str], redact: bool = False, max_columns: int = 50) -> str:
+    """
+    Produce a combined privacy-safe DDL string for *all* tables in
+    `table_names`. Each table's DDL (via `generate_privacy_safe_ddl`) is
+    concatenated together, separated by blank lines, so the LLM can see
+    the full schema across every uploaded file in the session.
+
+    If `table_names` is empty, returns an empty string.
+    """
+    blocks = []
+    for table_name in table_names:
+        try:
+            blocks.append(generate_privacy_safe_ddl(conn, table_name, redact=redact, max_columns=max_columns))
+        except Exception as exc:
+            blocks.append(f"-- Could not describe table {table_name}: {exc}")
+    return "\n\n".join(blocks)
