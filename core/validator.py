@@ -1,19 +1,3 @@
-# ─────────────────────────────────────────────
-#  core/validator.py  –  "Is this file safe to use?"
-#
-#  Five layered checks for plain-text files (CSV, JSON, TXT):
-#    1. File size
-#    2. Extension whitelist
-#    3. Known binary magic bytes (EXE, PDF, PNG, JPEG, ZIP, ELF etc.)
-#    4. Null byte check  (binaries almost always have null bytes)
-#    5. Printability / entropy check  (real text is >95% printable)
-#    6. Format-level check (JSON must parse, CSV must have structure)
-#
-#  For XLSX:
-#    1. File size
-#    2. Extension whitelist
-#    3. filetype.guess() byte verification
-# ─────────────────────────────────────────────
 
 import json
 import csv
@@ -23,19 +7,14 @@ import filetype
 from pathlib import Path
 from config import MAX_FILE_SIZE_BYTES, ALLOWED_EXTENSIONS
 
-# How many bytes we read for all checks
-SAMPLE_SIZE = 8192   # 8 KB — large enough to catch most disguised binaries
+SAMPLE_SIZE = 8192  
 
-# Minimum ratio of printable bytes to consider a file "text-like"
 PRINTABLE_THRESHOLD = 0.95
 
-# XLSX expected MIME from filetype
 EXPECTED_MIME = {
     ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 }
 
-# Known dangerous magic byte signatures
-# These are the first bytes of common binary formats
 DANGEROUS_SIGNATURES = [
     (b"MZ",            "Windows executable (EXE/DLL)"),
     (b"\x7fELF",       "Linux binary (ELF)"),
@@ -66,12 +45,7 @@ _DANGEROUS_FUNCTIONS = re.compile(
 def validate_file(uploaded_file) -> tuple[bool, str]:
     """
     Run all validation checks on an uploaded Streamlit file.
-
-    Returns:
-        (True,  "")            → file is safe to process
-        (False, "reason why")  → file was rejected
     """
-
     # ── Check 1: File size ────────────────────────────────────
     if uploaded_file.size > MAX_FILE_SIZE_BYTES:
         max_mb = MAX_FILE_SIZE_BYTES // (1024 * 1024)
@@ -85,24 +59,18 @@ def validate_file(uploaded_file) -> tuple[bool, str]:
             "Please upload a CSV, XLSX, JSON, or TXT file."
         )
 
-    # ── Read sample bytes (used by all remaining checks) ──────
     file_bytes = uploaded_file.read(SAMPLE_SIZE)
-    uploaded_file.seek(0)   # always rewind so later code can read the file
+    uploaded_file.seek(0)  
 
-    # ── XLSX: use filetype byte verification ──────────────────
     if suffix == ".xlsx":
         return _validate_xlsx(file_bytes, suffix)
 
-    # ── Plain text files: run all 4 text checks ───────────────
     return _validate_text_file(file_bytes, suffix, uploaded_file)
 
 
 def validate_sql_query(conn, sql: str, allowed_tables: list[str] | None = None) -> tuple[bool, str]:
     """
     Validate generated SQL before execution.
-
-    The query must be a single read-only statement, must not use dangerous
-    functions or DDL/DML tokens, and must parse successfully in DuckDB.
     """
     candidate = _normalize_sql(sql)
     if not candidate:
@@ -141,7 +109,6 @@ def validate_sql_query(conn, sql: str, allowed_tables: list[str] | None = None) 
 # ══════════════════════════════════════════════
 
 def _validate_xlsx(file_bytes: bytes, suffix: str) -> tuple[bool, str]:
-    """Verify XLSX files using filetype magic byte detection."""
     kind = filetype.guess(file_bytes)
     expected = EXPECTED_MIME[suffix]
 
@@ -163,12 +130,7 @@ def _validate_text_file(
     suffix: str,
     uploaded_file
 ) -> tuple[bool, str]:
-    """
-    Run four checks in order for CSV, JSON, TXT files.
-    Stops and returns the first failure found.
-    """
-
-    # ── Check 3: Known binary magic bytes ─────────────────────
+    
     for signature, description in DANGEROUS_SIGNATURES:
         if file_bytes.startswith(signature):
             return False, (
@@ -176,9 +138,6 @@ def _validate_text_file(
                 f"not a valid {suffix[1:].upper()} file."
             )
 
-    # ── Check 4: Null byte check ──────────────────────────────
-    # Real text files almost never contain null bytes.
-    # Binaries almost always do — even ones without known magic bytes.
     if b"\x00" in file_bytes:
         return False, (
             f"'{uploaded_file.name}' contains binary content (null bytes). "
@@ -186,8 +145,6 @@ def _validate_text_file(
         )
 
     # ── Check 5: Printability / entropy check ─────────────────
-    # Measure what fraction of bytes are normal text characters.
-    # Tabs (9), newlines (10, 13), and printable ASCII (32-126) count as text.
     if len(file_bytes) > 0:
         printable_count = sum(
             1 for b in file_bytes
@@ -202,56 +159,10 @@ def _validate_text_file(
                 f"Please upload a real {suffix[1:].upper()} file."
             )
 
-    # ── Check 6: Format-level structural check ─────────────────
-    if suffix == ".json":
-        return _check_json_structure(file_bytes, uploaded_file.name)
-
     if suffix in (".csv", ".txt"):
         return _check_csv_structure(file_bytes, uploaded_file.name, suffix)
 
-    # TXT with no further structure check — passes if it got here
     return True, ""
-
-
-def _check_json_structure(file_bytes: bytes, filename: str) -> tuple[bool, str]:
-    """
-    Attempt to decode and parse the JSON sample.
-    A renamed binary that passes byte checks will still fail here.
-    """
-    try:
-        text = file_bytes.decode("utf-8", errors="strict")
-    except UnicodeDecodeError:
-        return False, (
-            f"'{filename}' is not valid UTF-8 text. "
-            "Please upload a real JSON file."
-        )
-
-    # We only have a sample (first 8KB), so the JSON may be truncated.
-    # Try parsing the full sample; if it fails, try just the first line
-    # (newline-delimited JSON). Only reject if both clearly fail.
-    text_stripped = text.strip()
-
-    # Try as full JSON
-    try:
-        json.loads(text_stripped)
-        return True, ""
-    except json.JSONDecodeError:
-        pass
-
-    # Try first non-empty line (newline-delimited JSON)
-    for line in text_stripped.splitlines():
-        line = line.strip()
-        if line:
-            try:
-                json.loads(line)
-                return True, ""  # at least one line parses → file looks like NDJSON
-            except json.JSONDecodeError:
-                break   # first line doesn't parse → not JSON
-
-    return False, (
-        f"'{filename}' does not appear to contain valid JSON. "
-        "Please check the file and try again."
-    )
 
 
 def _check_csv_structure(
@@ -259,47 +170,37 @@ def _check_csv_structure(
     filename: str,
     suffix: str
 ) -> tuple[bool, str]:
-    """
-    Check that the file has consistent row/column structure.
-    A binary that passes byte checks won't have structured rows.
-    """
     try:
         text = file_bytes.decode("utf-8", errors="strict")
     except UnicodeDecodeError:
-        # Try latin-1 as fallback (common in older Excel exports)
         try:
             text = file_bytes.decode("latin-1", errors="strict")
         except Exception:
-            return False, (
-                f"'{filename}' could not be decoded as text. "
-                f"Please upload a real {suffix[1:].upper()} file."
-            )
+            return False, f"'{filename}' could not be decoded as text."
 
-    # Use Python's csv sniffer to detect the delimiter
+    # ── FIX: Handle mid-row slice for large text fields ─────────
+    # If the file is exactly 8KB, the byte chunk likely cuts off mid-row.
+    # Discard the last incomplete line to avoid false column-count mismatches.
+    if len(file_bytes) == SAMPLE_SIZE and '\n' in text:
+        text = text.rsplit('\n', 1)[0]
+
     try:
         sample = text[:2048]
         dialect = csv.Sniffer().sniff(sample, delimiters=",\t;|")
     except csv.Error:
-        # Sniffer couldn't detect a delimiter — still might be a single-column file
-        dialect = csv.excel   # fall back to comma
+        dialect = csv.excel   
 
-    # Read up to 5 rows and check column consistency
     try:
         reader = csv.reader(io.StringIO(text), dialect)
         rows   = [row for row, _ in zip(reader, range(5)) if row]
     except Exception:
-        return False, (
-            f"'{filename}' could not be parsed as a delimited file. "
-            f"Please upload a real {suffix[1:].upper()} file."
-        )
+        return False, f"'{filename}' could not be parsed as a delimited file."
 
     if not rows:
         return False, f"'{filename}' appears to be empty."
 
-    # Check that all sampled rows have the same number of columns
     col_counts = [len(row) for row in rows]
     if len(set(col_counts)) > 1 and max(col_counts) > 1:
-        # Allow minor variation (1 col difference) for files with trailing commas
         if max(col_counts) - min(col_counts) > 1:
             return False, (
                 f"'{filename}' has inconsistent column counts across rows "

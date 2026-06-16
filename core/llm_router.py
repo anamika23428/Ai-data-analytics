@@ -1,14 +1,3 @@
-# ─────────────────────────────────────────────
-# llm_router.py  –  Two-stage query router
-#
-# Stage 1: Regex keyword pre-filter  (~1ms, zero LLM cost, ~70% of queries)
-# Stage 2: Local Ollama LLM          (runs entirely on your machine — NO data
-#                                     ever leaves to any external service)
-#
-# Security: only the privacy-safe DDL schema + prompt are sent to Ollama.
-#           Raw data rows are NEVER included unless explicitly enabled.
-# ─────────────────────────────────────────────
-
 import re
 import json
 import logging

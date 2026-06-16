@@ -1,12 +1,3 @@
-# ─────────────────────────────────────────────
-#  core/transformer.py  –  Clean & profile a table
-#
-#  Fixes:
-#    1. Duplicate column names after sanitise → deduplicate with suffix
-#    2. SELECT DISTINCT * fails on LIST/STRUCT → keep original rows
-#    3. Missing values are reported, not silently imputed
-# ─────────────────────────────────────────────
-
 import re
 import duckdb
 from collections import Counter
