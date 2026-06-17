@@ -59,7 +59,12 @@ except ImportError:
 try:
     from config import SQL_MODEL
 except ImportError:
-    SQL_MODEL = "qwen2.5-coder:7b"
+    SQL_MODEL = "qwen2.5-coder:1.5b"   # keep in sync with config.py
+
+
+def _qident(name: str) -> str:
+    """Return a safely double-quoted DuckDB identifier (handles spaces & special chars)."""
+    return '"' + name.replace('"', '""')+'"'  
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -114,6 +119,9 @@ Rules:
 - aggregation must be one of: sum, avg, count, min, max, none
 - All string values must use double quotes.
 - null values must be JSON null (not the string "null").
+- Column names in the JSON MUST match the schema exactly, including spaces
+  (e.g. use "total joining count" not "total_joining_count").
+- If a column name contains spaces, still write it exactly as in the schema.
 """
 
 _INTENT_USER = """\
@@ -205,14 +213,18 @@ Rules:
 - Output ONLY the SQL query. No explanation, no markdown fences, no preamble.
 - Use only SELECT or WITH. Never INSERT, UPDATE, DELETE, DROP, CREATE, ALTER.
 - Reference only tables and columns from the provided schema.
-- Prefer the "primary table" given below. If the question requires columns
+- Prefer the \"primary table\" given below. If the question requires columns
   from another table in the schema, you may JOIN to that table using a
   sensible shared column (e.g. matching id/key column names).
-- Quote column names that contain spaces or special characters with double-quotes.
+- ALWAYS double-quote every column name and table name — especially those
+  containing spaces (e.g. \"total joining count\", \"session date\").
 - End with a semicolon.
 - Apply aggregations and GROUP BY as indicated by the intent.
 - Apply ORDER BY and LIMIT as indicated by the intent.
 - Keep the query minimal — only fetch columns needed for the chart.
+- PIPE-DELIMITED COLUMNS: if a column stores multiple values separated by '|'
+  (e.g. category), use UNNEST(STRING_SPLIT(col, '|')) to expand them before
+  grouping or counting.
 """
 
 _SQL_USER = """\
@@ -312,7 +324,7 @@ def _validate_sql(conn, sql: str, table: str, tables: list[str], intent: dict) -
         # Columns of the chosen target table (primary check).
         target_cols: set[str] = set(
             row[0].lower()
-            for row in conn.execute(f"DESCRIBE {table}").fetchall()
+            for row in conn.execute(f"DESCRIBE {_qident(table)}").fetchall()
         )
 
         # Union of columns across every OTHER loaded table — used only to
@@ -324,7 +336,7 @@ def _validate_sql(conn, sql: str, table: str, tables: list[str], intent: dict) -
             try:
                 other_cols.update(
                     row[0].lower()
-                    for row in conn.execute(f"DESCRIBE {t}").fetchall()
+                    for row in conn.execute(f"DESCRIBE {_qident(t)}").fetchall()
                 )
             except Exception:
                 pass
