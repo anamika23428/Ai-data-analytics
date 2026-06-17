@@ -1,3 +1,14 @@
+# ─────────────────────────────────────────────
+#  core/transformer.py  –  Clean & profile a table
+#
+#  Fixes:
+#    1. Duplicate column names after sanitise → deduplicate with suffix
+#    2. Safe Deduplication → Uses a TRANSACTION and temp table swap so 
+#       failed deduplications (e.g. LIST/STRUCT types) rollback cleanly 
+#       without destroying the original table.
+#    3. Missing values are reported, not silently imputed
+# ─────────────────────────────────────────────
+
 import re
 import duckdb
 from collections import Counter
@@ -8,15 +19,21 @@ def clean_and_profile(conn: duckdb.DuckDBPyConnection, table_name: str) -> dict:
     # ── Step 1: Row count before dedup ────────────────────────
     original_rows = conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
 
-    # ── Step 2: Deduplicate inside DuckDB ─────────────────────
-    # SELECT DISTINCT * fails on LIST/STRUCT columns, so we try it.
-    # If DuckDB cannot deduplicate safely, we keep the original rows.
+    # ── Step 2: Deduplicate inside DuckDB (Safe Transaction) ──
+    # We use a temporary table swap. If DISTINCT fails (e.g., on complex JSON arrays),
+    # the rollback protects the original data from being corrupted.
     duplicates_removed = 0
     try:
-        conn.execute(f"CREATE OR REPLACE TABLE {table_name} AS SELECT DISTINCT * FROM {table_name}")
+        conn.execute("BEGIN TRANSACTION")
+        conn.execute(f"CREATE TABLE {table_name}_tmp AS SELECT DISTINCT * FROM {table_name}")
+        conn.execute(f"DROP TABLE {table_name}")
+        conn.execute(f"ALTER TABLE {table_name}_tmp RENAME TO {table_name}")
+        conn.execute("COMMIT")
+        
         clean_rows         = conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
         duplicates_removed = original_rows - clean_rows
     except Exception:
+        conn.execute("ROLLBACK")
         clean_rows = original_rows
         duplicates_removed = 0
 
@@ -30,6 +47,7 @@ def clean_and_profile(conn: duckdb.DuckDBPyConnection, table_name: str) -> dict:
     for old, new in zip(columns, new_columns):
         if old != new:
             try:
+                # Old column is properly quoted to handle illegal source characters
                 conn.execute(f'ALTER TABLE {table_name} RENAME "{old}" TO "{new}"')
             except Exception:
                 pass  # already renamed or identical

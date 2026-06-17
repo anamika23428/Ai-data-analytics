@@ -4,6 +4,7 @@ import logging
 import sys
 import requests
 from config import OLLAMA_BASE_URL, ROUTER_MODEL, OLLAMA_TIMEOUT
+from core.rule_router import classify as rule_classify
 
 logger = logging.getLogger(__name__)
 
@@ -88,31 +89,22 @@ OUTPUT FORMAT — Return EXACTLY this JSON structure, nothing else:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ROUTE LABELS — Choose exactly one:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-"visualization"  → User wants a chart, graph, or plot. Also use this when the
-                   user asks for a breakdown/comparison grouped by a category
-                   (e.g. "average salary by department", "total sales per region").
-"sql_answer"     → User wants a single value, name, list, or ranking WITHOUT
-                   grouping (e.g. "what is the total revenue", "top 5 products").
-"metadata"       → User asks about structure — column names, data types, schema.
-                   NOT for "how many rows" (that is sql_answer).
+"visualization"  → User wants a chart, graph, or plot. Also use for grouped data 
+                   (e.g., "average salary by department", "total sales per region").
+"sql_answer"     → User wants to extract ACTUAL DATA ROWS, values, lists, counts, or unique items.
+                   (e.g., "how many unique categories are there", "list all names", "total revenue").
+"metadata"       → STRICTLY for database structure questions.
+                   (e.g., "what columns are in this table", "show me the schema", "data types").
 "statistical"    → User wants outlier detection, percentile, z-score, correlation, etc.
 "reasoning"      → User wants explanation, summary, or business insight.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-CONFIDENCE LEVELS:
+CRITICAL ROUTING RULES — DO NOT FAIL THESE:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-HIGH   → Question is very clear and unambiguous.
-MEDIUM → Question is mostly clear but has minor ambiguity.
-LOW    → Question is unclear or could belong to multiple routes.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-CRITICAL RULES:
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-- Output ONLY the JSON object. No text before. No text after. No markdown.
-- Do NOT wrap the JSON in backticks or code blocks.
-- Use ONLY column names from the schema — never invent column names.
-- All string values must use double quotes.
-- confidence must be exactly one of: HIGH, MEDIUM, LOW
+1. DO NOT use "metadata" just because a user mentions a column name. 
+2. If a user asks "how many unique categories are there", "list all unique items", or "what are the categories", they want to query the DATA ROWS. This MUST be routed to "sql_answer".
+3. "metadata" MUST ONLY be used if the user explicitly asks about the design of the database itself (e.g., "what columns exist", "describe the table").
+4. Output ONLY the JSON object. No markdown, no backticks.
 """
 
 
@@ -173,28 +165,47 @@ def route_query(
     table_name:   str,
     sample_rows:  list[dict] | None = None,
     print_to_terminal: bool = True,
+    known_columns: set[str] | None = None,   # NEW — optional, for the by/per check
 ) -> dict:
     """
-    Route a user query to the correct analytics handler using a local Ollama LLM.
-
-    Args:
-        user_prompt:       The user's natural language question.
-        ddl_schema:        Privacy-safe DDL string (schema only, no row data).
-                           May contain MULTIPLE table definitions if more than
-                           one file is loaded in this session.
-        table_name:        Comma-separated names of all tables currently
-                           loaded in this session.
-        sample_rows:       Optional first-3 rows for LLM context.
-                           NOTE: only include if your data policy permits it.
-        print_to_terminal: If True, pretty-prints the decision to stdout.
-
-    Returns a dict with keys:
-        success, stage, parsed (route/confidence/chart_type/…), model, error
+    Route a user query using a rule-based pre-filter first, falling back
+    to the local Ollama LLM only when the rule filter is ambiguous.
     """
+    rule_result = rule_classify(user_prompt, known_columns=known_columns)
 
-    # ── Local Ollama LLM Routing ─────────────
-    # Only schema DDL (+ optional sample rows) is sent.
-    # Raw data is never included. Ollama runs locally — nothing leaves your machine.
+    if not rule_result["ambiguous"]:
+        parsed = {
+            "route":       rule_result["route"],
+            "confidence":  rule_result["confidence"],
+            "chart_type":  None,
+            "x_axis":      None,
+            "y_axis":      None,
+            "aggregation": "none",
+            "title":       "",
+            "explanation": f"Rule-based match: {rule_result['matches']}",
+        }
+        result = {
+            "success":      True,
+            "stage":        "rule",
+            "parsed":       parsed,
+            "model":        "rule_router",
+            "error":        None,
+            "user_message": None,
+        }
+        if print_to_terminal:
+            _print_route(result)
+        return result
+
+    # ── Ambiguous: fall through to the LLM, narrowed to the candidates ────
+    candidate_hint = ""
+    if rule_result["candidates"]:
+        candidate_hint = (
+            f"\nA preliminary scan flagged this question as possibly matching "
+            f"MULTIPLE routes: {', '.join(rule_result['candidates'])}. "
+            f"Choose the single best route from that shortlist unless neither "
+            f"one actually fits — in that case choose whichever route is correct.\n"
+        )
+
     sample_section = ""
     if sample_rows:
         sample_section = (
@@ -205,7 +216,8 @@ def route_query(
     user_message = (
         f"Database Schema:\n{ddl_schema}\n"
         f"{sample_section}\n"
-        f"Available Tables: {table_name}\n\n"
+        f"Available Tables: {table_name}\n"
+        f"{candidate_hint}\n"
         f"User Question: {user_prompt}"
     )
 
@@ -215,8 +227,8 @@ def route_query(
     ]
 
     logger.info(
-        "LLM routing — model=%s table=%s prompt='%s'",
-        ROUTER_MODEL, table_name, user_prompt[:80],
+        "Ambiguous (%s) — LLM routing — model=%s table=%s prompt='%s'",
+        rule_result["candidates"], ROUTER_MODEL, table_name, user_prompt[:80],
     )
 
     try:
@@ -227,11 +239,6 @@ def route_query(
         parsed["confidence"] = str(parsed.get("confidence", "MEDIUM")).upper()
         if parsed["confidence"] not in ("HIGH", "MEDIUM", "LOW"):
             parsed["confidence"] = "MEDIUM"
-
-        logger.info(
-            "Routing decision — route=%s confidence=%s chart=%s",
-            parsed.get("route"), parsed.get("confidence"), parsed.get("chart_type"),
-        )
 
         result = {
             "success":      True,
@@ -246,25 +253,18 @@ def route_query(
         return result
 
     except requests.exceptions.ConnectionError:
-        msg = (
-            f"Cannot connect to Ollama at {OLLAMA_BASE_URL}. "
-            f"Make sure Ollama is running: `ollama serve`"
-        )
+        msg = f"Cannot connect to Ollama at {OLLAMA_BASE_URL}. Make sure Ollama is running: `ollama serve`"
         logger.error(msg)
-        result = {
-            "success": False, "stage": "llm", "parsed": None,
-            "model": ROUTER_MODEL, "error": msg, "user_message": user_message,
-        }
+        result = {"success": False, "stage": "llm", "parsed": None,
+                   "model": ROUTER_MODEL, "error": msg, "user_message": user_message}
         if print_to_terminal:
             _print_route(result)
         return result
 
     except Exception as exc:
         logger.error("LLM routing failed: %s", exc, exc_info=True)
-        result = {
-            "success": False, "stage": "llm", "parsed": None,
-            "model": ROUTER_MODEL, "error": str(exc), "user_message": user_message,
-        }
+        result = {"success": False, "stage": "llm", "parsed": None,
+                  "model": ROUTER_MODEL, "error": str(exc), "user_message": user_message}
         if print_to_terminal:
             _print_route(result)
         return result

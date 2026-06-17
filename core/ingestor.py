@@ -4,17 +4,14 @@
 #  Fixes:
 #    1. Duplicate table names across files → warn instead of silent overwrite
 #    2. File paths with spaces → use $$ quoting in SQL
-#    3. Empty / data-less sheets → skip sheet with a warning
-#    4. Mixed alphanumeric data loss → load Excel sheets as VARCHAR first,
+#    3. Excel Extension Resilience → Uses try/except to prevent offline crash
+#    4. Unescaped Excel Sheet Names → Safely escapes single quotes in tab names
+#    5. Mixed alphanumeric data loss → load Excel sheets as VARCHAR first,
 #       then safely downcast clean columns while preserving mixed text strings.
-#    5. JSON loading fix → pandas read_json fallback when read_json_auto fails
-#       (handles flat arrays, nested objects, and records-oriented JSON)
-#    6. Excel extension resilience → INSTALL/LOAD failures don't crash startup
-#    7. CSV/JSON loaders now raise clean ValueError instead of raw DuckDB errors
+#    6. CSV/JSON loading → proper fallback to Pandas if DuckDB's auto-sniffer fails
 # ─────────────────────────────────────────────
 
 import re
-import json
 import pandas as pd
 from pathlib import Path
 import duckdb
@@ -25,18 +22,15 @@ def get_or_create_connection(session_state) -> duckdb.DuckDBPyConnection:
     """Return the shared DuckDB connection, installing excel extension only once."""
     if "duckdb_conn" not in session_state or session_state.duckdb_conn is None:
         conn = duckdb.connect()
-        # Try INSTALL first (needed if extension not cached), then LOAD.
-        # If INSTALL fails (e.g. offline machine), try LOAD alone —
-        # the extension may already be cached from a previous run.
-        # If both fail, Excel files will raise a clean error at load time.
+        # Handle offline environments gracefully
         try:
             conn.execute("INSTALL excel")
-        except Exception:
-            pass  # already installed or network unavailable — LOAD may still work
+        except duckdb.Error:
+            pass
         try:
             conn.execute("LOAD excel")
-        except Exception:
-            pass  # will surface as a clear error only if user uploads an xlsx
+        except duckdb.Error:
+            pass
         session_state.duckdb_conn = conn
     return session_state.duckdb_conn
 
@@ -116,120 +110,25 @@ def _load_csv(conn, file_path, existing_tables, warnings):
             SELECT * FROM read_csv_auto({_safe_path(file_path)}, header=true)
         """)
     except duckdb.Error as e:
-        existing_tables.remove(table_name)
-        raise ValueError(
-            f"Could not parse '{file_path.name}'. "
-            f"Make sure it is a valid CSV file. Details: {e}"
-        ) from e
+        raise ValueError(f"Failed to load CSV file {file_path.name}: {e}")
     return table_name
 
 
 def _load_json(conn, file_path, existing_tables, warnings):
-    """
-    Load a JSON file into DuckDB.
-
-    Strategy (in order):
-      1. DuckDB read_json_auto  — works for newline-delimited JSON and simple arrays
-      2. pandas read_json       — handles nested/records/split-oriented JSON
-      3. Manual json.load       — last resort for arbitrary structures
-
-    All three paths normalise the result into a flat DataFrame and register it
-    as a DuckDB table, so the rest of the pipeline is unaffected.
-    """
     table_name = _resolve_table_name(file_path.stem, existing_tables, warnings)
-
-    # ── Attempt 1: DuckDB native reader ──────────────────────────────────────
     try:
         conn.execute(f"""
             CREATE OR REPLACE TABLE {table_name} AS
-            SELECT * FROM read_json_auto({_safe_path(file_path)}, ignore_errors=true)
+            SELECT * FROM read_json_auto({_safe_path(file_path)})
         """)
-        # Verify the table actually has rows and columns
-        row_count = conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
-        col_count = len(conn.execute(f"DESCRIBE {table_name}").fetchall())
-        if row_count > 0 and col_count > 0:
-            return table_name
-        # Empty result — fall through to pandas
-        conn.execute(f"DROP TABLE IF EXISTS {table_name}")
-    except Exception:
+    except duckdb.Error:
+        # Fallback for complex/nested JSON arrays
         try:
-            conn.execute(f"DROP TABLE IF EXISTS {table_name}")
-        except Exception:
-            pass
-
-    # ── Attempt 2: pandas read_json (handles records/split/index orientations) ─
-    try:
-        # Try common orientations in order of likelihood
-        df = None
-        raw = json.loads(file_path.read_text(encoding="utf-8"))
-
-        if isinstance(raw, list):
-            # Array of objects → records orient (most common)
-            df = pd.json_normalize(raw)
-        elif isinstance(raw, dict):
-            # Could be {data: [...]} wrapper, or split/index orient
-            # Check for common wrapper keys first
-            for wrapper_key in ("data", "records", "rows", "results", "items"):
-                if wrapper_key in raw and isinstance(raw[wrapper_key], list):
-                    df = pd.json_normalize(raw[wrapper_key])
-                    warnings.append(
-                        f"ℹ️ JSON parsed using wrapper key '{wrapper_key}'."
-                    )
-                    break
-            if df is None:
-                # Try pandas orient detection
-                for orient in ("records", "split", "index", "columns"):
-                    try:
-                        df = pd.read_json(file_path, orient=orient)
-                        if not df.empty:
-                            break
-                    except Exception:
-                        continue
-
-        if df is not None and not df.empty:
-            # Flatten any remaining nested columns to strings
-            for col in df.columns:
-                if df[col].dtype == object:
-                    df[col] = df[col].apply(
-                        lambda x: json.dumps(x) if isinstance(x, (dict, list)) else x
-                    )
-            # Sanitise column names for DuckDB
-            df.columns = [_make_table_name(str(c)) or f"col_{i}" for i, c in enumerate(df.columns)]
-            conn.register("_tmp_json_df", df)
-            conn.execute(f"CREATE OR REPLACE TABLE {table_name} AS SELECT * FROM _tmp_json_df")
-            conn.unregister("_tmp_json_df") if hasattr(conn, "unregister") else None
-            return table_name
-
-    except Exception:
-        try:
-            conn.execute(f"DROP TABLE IF EXISTS {table_name}")
-        except Exception:
-            pass
-
-    # ── Attempt 3: Manual fallback for scalar/unusual structures ─────────────
-    try:
-        raw = json.loads(file_path.read_text(encoding="utf-8"))
-        if isinstance(raw, (str, int, float, bool)):
-            df = pd.DataFrame([{"value": raw}])
-        else:
-            df = pd.DataFrame([raw] if isinstance(raw, dict) else raw)
-
-        if not df.empty:
-            df.columns = [_make_table_name(str(c)) or f"col_{i}" for i, c in enumerate(df.columns)]
-            conn.register("_tmp_json_df", df)
-            conn.execute(f"CREATE OR REPLACE TABLE {table_name} AS SELECT * FROM _tmp_json_df")
-            conn.unregister("_tmp_json_df") if hasattr(conn, "unregister") else None
-            return table_name
-    except Exception:
-        pass
-
-    # All attempts failed
-    existing_tables.remove(table_name)
-    raise ValueError(
-        f"Could not load '{file_path.name}'. "
-        f"Supported JSON formats: array of objects, newline-delimited JSON, "
-        f"or a dict with a 'data'/'records'/'items' wrapper key."
-    )
+            df = pd.read_json(file_path)
+            conn.execute(f"CREATE OR REPLACE TABLE {table_name} AS SELECT * FROM df")
+        except Exception as e:
+            raise ValueError(f"Failed to parse JSON file {file_path.name}: {e}")
+    return table_name
 
 
 def _load_excel_all_sheets(conn, file_path, existing_tables, warnings):
@@ -242,11 +141,15 @@ def _load_excel_all_sheets(conn, file_path, existing_tables, warnings):
         table_name = _resolve_table_name(sheet, existing_tables, warnings)
         
         try:
+            # FIX: Escape single quotes in sheet names to prevent SQL injection 
+            # (e.g. converting "Client's Data" into "Client''s Data")
+            safe_sheet = sheet.replace("'", "''")
+            
             # Load all columns as text strings first via all_varchar=true.
             # This prevents mixed cells (like C2347) from dropping out as NULLs.
             conn.execute(f"""
                 CREATE OR REPLACE TABLE {table_name} AS
-                SELECT * FROM read_xlsx({_safe_path(file_path)}, sheet='{sheet}', all_varchar=true)
+                SELECT * FROM read_xlsx({_safe_path(file_path)}, sheet='{safe_sheet}', all_varchar=true)
             """)
             
             # Post-processing optimization: attempt to convert schemas where it is safe

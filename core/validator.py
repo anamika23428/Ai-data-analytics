@@ -33,7 +33,7 @@ DANGEROUS_SIGNATURES = [
 
 _READ_ONLY_PREFIX = re.compile(r"^\s*(select|with)\b", re.IGNORECASE)
 _DANGEROUS_SQL_TOKENS = re.compile(
-    r"\b(insert|update|delete|drop|alter|create|replace|attach|detach|copy|pragma|call|execute|vacuum|analyze|transaction|begin|commit|rollback|export|import|install|load)\b",
+    r"\b(insert|update|delete|drop|alter|create|attach|detach|copy|pragma|call|execute|vacuum|analyze|transaction|begin|commit|rollback|export|import|install|load)\b",
     re.IGNORECASE,
 )
 _DANGEROUS_FUNCTIONS = re.compile(

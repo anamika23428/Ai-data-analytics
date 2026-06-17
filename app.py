@@ -1,5 +1,15 @@
 import sys
 from pathlib import Path
+import socket
+
+# ── FIX: Force Python to use IPv4 so 'localhost' doesn't crash on Windows ──
+old_getaddrinfo = socket.getaddrinfo
+def new_getaddrinfo(*args, **kwargs):
+    responses = old_getaddrinfo(*args, **kwargs)
+    return [r for r in responses if r[0] == socket.AF_INET]
+socket.getaddrinfo = new_getaddrinfo
+# ───────────────────────────────────────────────────────────────────────────
+
 sys.path.insert(0, str(Path(__file__).parent))
 
 import streamlit as st
@@ -26,10 +36,9 @@ from config import PROMPT_MAX_LENGTH
 from core.llm_router import route_query
 from core.ddl_utils import generate_privacy_safe_ddl, generate_multi_table_ddl
 from core.route_a import run as run_route_a
-from core.route_c import run as run_route_c
-from core.route_d import run as run_route_d
-from core.sql_engine import generate_safe_sql  
-from core.insight_engine import generate_natural_language_insight 
+from core.sql_engine import generate_safe_sql
+# --- DISABLED INSIGHT ENGINE ---
+# from core.insight_engine import generate_natural_language_insight
 from config import DDL_MAX_COLUMNS
 
 # ── Logging: route decisions visible in terminal ──
@@ -139,34 +148,19 @@ def _render_assistant_message(msg: dict):
         return
 
     if msg["route"] == "metadata":
-        # ── Schema queries: show DDL + DESCRIBE for each table ──
-        if msg.get("tables"):
-            st.subheader("🗂️ Schema Information")
-            for t_data in msg["tables"]:
-                with st.expander(f"Table: `{t_data['name']}`", expanded=True):
-                    st.code(t_data["ddl"], language="sql")
-                    if t_data.get("info_df") is not None:
-                        st.dataframe(t_data["info_df"], use_container_width=True)
-
-        # ── Keyword-match queries: show plain answer + optional result table ──
-        if msg.get("answer"):
-            st.markdown(msg["answer"])
-        if msg.get("df") is not None:
-            st.dataframe(msg["df"], use_container_width=True)
-            st.download_button(
-                "⬇️ Download CSV",
-                data=msg["df"].to_csv(index=False).encode("utf-8"),
-                file_name="metadata_result.csv",
-                mime="text/csv",
-                key=f"dl_meta_{msg['id']}",
-            )
+        st.subheader("🗂️ Schema Information")
+        for t_data in msg.get("tables", []):
+            with st.expander(f"Table: `{t_data['name']}`", expanded=True):
+                st.code(t_data["ddl"], language="sql")
+                if t_data.get("info_df") is not None:
+                    st.dataframe(t_data["info_df"], width="stretch")
 
     elif msg["route"] == "visualization":
         with st.expander("🔎 Generated SQL", expanded=False):
             st.code(msg["sql"], language="sql")
 
         st.subheader(f"📊 {msg['intent'].get('title', 'Visualization')}")
-        st.plotly_chart(msg["fig"], use_container_width=True)
+        st.plotly_chart(msg["fig"], width="stretch")
 
         col_csv, col_html = st.columns(2)
         with col_csv:
@@ -187,39 +181,22 @@ def _render_assistant_message(msg: dict):
             )
 
         with st.expander("📋 Raw query result", expanded=False):
-            st.dataframe(msg["df"].head(50), use_container_width=True)
-
-    elif msg["route"] in ("statistical", "reasoning"):
-        # Route D: Statistical results + AI observation
-        if msg.get("answer"):
-            st.markdown(f"**📊 AI Observation:** {msg['answer']}")
-            st.divider()
-
-        if msg.get("sql"):
-            with st.expander("🔎 Generated SQL", expanded=False):
-                st.code(msg["sql"], language="sql")
-
-        if msg.get("df") is not None:
-            st.subheader("📋 Statistical Results")
-            st.dataframe(msg["df"].head(50), use_container_width=True)
-            st.download_button(
-                "⬇️ Download CSV",
-                data=msg["df"].to_csv(index=False).encode("utf-8"),
-                file_name="statistical_result.csv",
-                mime="text/csv",
-                key=f"dl_stat_{msg['id']}",
-            )
+            st.dataframe(msg["df"].head(50), width="stretch")
 
     else:
-        # Route B: sql_answer — plain-English answer + SQL + result table
         if msg.get("insight"):
             st.markdown(f"**Answer:** {msg['insight']}")
             st.divider()
 
         st.subheader("🔎 Generated SQL")
         st.code(msg["sql"], language="sql")
-        st.subheader("📋 Query result (first 50 rows)")
-        st.dataframe(msg["df"].head(50), use_container_width=True)
+        total_rows = len(msg["df"])
+        if total_rows > 50:
+            st.subheader(f"📋 Query result (Showing first 50 of {total_rows} total rows)")
+            st.dataframe(msg["df"].head(50), width="stretch")
+        else:
+            st.subheader(f"📋 Query result ({total_rows} rows)")
+            st.dataframe(msg["df"], width="stretch")
         st.download_button(
             "Download CSV",
             data=msg["df"].to_csv(index=False).encode("utf-8"),
@@ -250,7 +227,7 @@ with st.sidebar:
         "▶  Load Files",
         type="primary",
         disabled=(not uploaded_files),
-        use_container_width=True,
+        use_container_width=True, 
     )
 
     if st.session_state.duckdb_conn and st.session_state.loaded_tables:
@@ -267,7 +244,7 @@ with st.sidebar:
                 st.markdown(f"**`{t}`**")
                 st.dataframe(
                     st.session_state.duckdb_conn.execute(f"SELECT * FROM {t} LIMIT 5").df(),
-                    use_container_width=True,
+                    width="stretch",
                 )
 
         st.divider()
@@ -354,9 +331,6 @@ else:
                 with st.spinner("Analyzing..."):
 
                     # Build DDL for the router (schema only, no row data)
-                    # NOTE: No hardcoded dataset-specific hints here — the improved
-                    # sql_engine and route_a use live DESCRIBE calls to get exact
-                    # column names for any dataset automatically.
                     ddl_for_router = (
                         generate_multi_table_ddl(
                             conn, tables, redact=False, max_columns=DDL_MAX_COLUMNS
@@ -396,19 +370,41 @@ else:
                             "⚠️ The query router is unsure. Proceeding as sql_answer."
                         )
 
+                    # ── Route: reasoning ──────────────────────────────────────
+                    if route_label == "reasoning":
+                        with st.spinner("Analyzing context..."):
+                            try:
+                                df_empty = pd.DataFrame()
+                                # --- DISABLED INSIGHT ENGINE ---
+                                # insight = generate_natural_language_insight(
+                                #     prompt=prompt,
+                                #     ddl_schema=ddl_for_router,
+                                #     sql="-- Reasoning Route (No SQL executed)",
+                                #     df=df_empty,
+                                # )
+                                # assistant_msg["insight"] = insight
+                                
+                                assistant_msg["insight"] = "*(The Natural Language Insight Engine is currently disabled. Displaying raw data only.)*"
+                                assistant_msg["sql"] = "-- Analyzed context directly"
+                                assistant_msg["df"] = df_empty
+                            except Exception as e:
+                                assistant_msg["error"] = f"Reasoning Engine Error: {str(e)}"
+                                
+                        _render_assistant_message(assistant_msg)
+
                     # ── Route: metadata ───────────────────────────────────────
-                    if route_label == "metadata":
-                        route_c_result = run_route_c(conn=conn, tables=tables, prompt=prompt)
-                        if not route_c_result.success:
-                            assistant_msg["error"] = route_c_result.error or "Route C failed."
-                        else:
-                            assistant_msg["answer"] = route_c_result.answer
-                            # Pass tables payload for the schema DDL renderer (may be None for keyword queries)
-                            if route_c_result.tables:
-                                assistant_msg["tables"] = route_c_result.tables
-                            # Pass dataframe for keyword-match results (unique values, frequency tables, etc.)
-                            if route_c_result.dataframe is not None:
-                                assistant_msg["df"] = route_c_result.dataframe
+                    elif route_label == "metadata":
+                        tables_data = []
+                        for t in tables:
+                            ddl = generate_privacy_safe_ddl(
+                                conn, t, redact=False, max_columns=DDL_MAX_COLUMNS
+                            )
+                            try:
+                                info_df = conn.execute(f"DESCRIBE {t}").df()
+                            except Exception:
+                                info_df = None
+                            tables_data.append({"name": t, "ddl": ddl, "info_df": info_df})
+                        assistant_msg["tables"] = tables_data
                         _render_assistant_message(assistant_msg)
 
                     # ── Route: visualization ──────────────────────────────────
@@ -436,32 +432,13 @@ else:
                             })
                         _render_assistant_message(assistant_msg)
 
-                    elif route_label in ("statistical", "reasoning"):
-                        with st.spinner("Running statistical analysis..."):
-                            route_d_result = run_route_d(
-                                conn=conn,
-                                tables=tables,
-                                prompt=prompt,
-                                ddl_schema=ddl_for_router,
-                                route_label=route_label,
-                            )
-                        if not route_d_result.success:
-                            assistant_msg["error"] = route_d_result.error or "Route D failed."
-                            assistant_msg["sql"] = route_d_result.sql
-                        else:
-                            assistant_msg.update({
-                                "answer": route_d_result.answer,
-                                "sql":    route_d_result.sql,
-                                "df":     route_d_result.dataframe,
-                            })
-                        _render_assistant_message(assistant_msg)
-
+                    # ── Route: sql_answer / statistical ───────────
                     else:
                         sql_result = generate_safe_sql(
                             prompt=prompt,
                             ddl_schema=ddl_for_router,
-                            table_name=tables[0] if tables else "",
-                            db_session=conn,   # passed so sql_engine can DESCRIBE tables
+                            table_name=", ".join(tables) if tables else "",
+                            db_session=conn,
                         )
                         if not sql_result["success"]:
                             assistant_msg["error"] = (
@@ -479,19 +456,20 @@ else:
                                     df = conn.execute(sql).df()
                                     assistant_msg.update({"sql": sql, "df": df})
 
-                                    with st.spinner("Generating natural language answer..."):
-                                        try:
-                                            insight = generate_natural_language_insight(
-                                                prompt=prompt,
-                                                ddl_schema=ddl_for_router,
-                                                sql=sql,
-                                                df=df,
-                                            )
-                                            assistant_msg["insight"] = insight
-                                        except Exception as e:
-                                            assistant_msg["warning"] = (
-                                                f"Insight Error: {str(e)}"
-                                            )
+                                    # --- DISABLED INSIGHT ENGINE ---
+                                    # with st.spinner("Generating natural language answer..."):
+                                    #     try:
+                                    #         insight = generate_natural_language_insight(
+                                    #             prompt=prompt,
+                                    #             ddl_schema=ddl_for_router,
+                                    #             sql=sql,
+                                    #             df=df,
+                                    #         )
+                                    #         assistant_msg["insight"] = insight
+                                    #     except Exception as e:
+                                    #         assistant_msg["warning"] = (
+                                    #             f"Insight Error: {str(e)}"
+                                    #         )
 
                                 except Exception as e:
                                     assistant_msg["error"] = f"Execution error: {e}"

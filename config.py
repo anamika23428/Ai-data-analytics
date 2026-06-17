@@ -69,7 +69,7 @@ INTENT_MODEL = "llama3.2:3b"
 # ─────────────────────────────────────────────
 
 # The heavy-duty coding model used to generate DuckDB SQL queries
-SQL_MODEL = "qwen2.5-coder:1.5b"
+SQL_MODEL = "qwen2.5-coder:7b"
 
 # NEW: The analytical model used to convert SQL data into human-readable English answers
-INSIGHT_MODEL = "llama3.1:3b"
+INSIGHT_MODEL = "llama3.1:8b"

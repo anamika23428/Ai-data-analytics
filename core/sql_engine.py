@@ -36,16 +36,18 @@ COLUMN RULES — THIS IS CRITICAL:
 MULTI-TABLE & "ENTIRE FILE" QUERIES:
 1. If the user asks about the whole file or all data, use UNION ALL.
 2. CRITICAL FILTER: You MUST read the COLUMN DICTIONARY before adding a table to the UNION. 
-3. If a table DOES NOT have the relevant column (e.g., you need employee names, but the table only has "Session Name", "Track Name", or metrics), YOU MUST SKIP THAT TABLE ENTIRELY.
-4. NEVER write `SELECT name FROM table` unless the exact word "name" is in the dictionary for that specific table. If it uses "EMPNAME" or "Employee Name", use that exactly and alias it (e.g., SELECT "EMPNAME" AS name).
+3. If a table DOES NOT have the relevant column, YOU MUST SKIP THAT TABLE ENTIRELY.
+4. NEVER write `SELECT name FROM table` unless the exact word "name" is in the dictionary.
+
+DUCKDB STRING CONVERSION RULES (CRITICAL):
+- To convert currency/price strings to numbers, remove symbols first: TRY_CAST(REPLACE(REPLACE(col, '₹', ''), ',', '') AS DOUBLE).
+- To convert percentage strings to numbers: TRY_CAST(REPLACE(col, '%', '') AS DOUBLE).
+- ALWAYS use TRY_CAST, never plain CAST, when converting any text/VARCHAR column to a numeric or date type for comparison or filtering. A single malformed value (e.g. a stray '|' or empty string) inside a bare CAST will crash the ENTIRE query; TRY_CAST returns NULL for that value instead and lets the rest of the query complete normally.
 
 DUCKDB-SPECIFIC RULES:
 - When using SUM/AVG/COUNT/MIN/MAX, always include the matching GROUP BY clause.
 - Use UNNEST(STRING_SPLIT(col, '|')) to expand pipe-delimited multi-value columns.
-- Use TRY_CAST(col AS DOUBLE) to safely convert text columns to numbers.
-- Use STRFTIME('%Y-%m', col) for month-level date grouping.
 - Column aliases defined in SELECT can be used in ORDER BY, but NOT in WHERE or HAVING.
-- Do NOT wrap a simple aggregation query in an unnecessary subquery.
 - LIMIT always goes after ORDER BY.
 """
 
@@ -108,6 +110,21 @@ def _extract_sql(raw: str) -> str | None:
     return sql
 
 
+def _harden_casts(sql: str) -> str:
+    """
+    Defensively upgrade bare CAST(...) to TRY_CAST(...).
+    This is a read-only analytics tool over arbitrary, often messy
+    uploaded data. A single malformed value (e.g. a stray '|' in what
+    should be a numeric column) should never crash an entire query.
+    TRY_CAST returns NULL for that one row instead of raising, which
+    WHERE/ORDER BY then handle naturally rather than erroring out.
+    \bCAST won't match inside TRY_CAST, since '_' and 'C' are both word
+    characters in regex — there's no boundary between them, so this is
+    safe to run even on SQL that already uses TRY_CAST elsewhere.
+    """
+    return re.sub(r"\bCAST\s*\(", "TRY_CAST(", sql, flags=re.IGNORECASE)
+
+
 def _call_ollama(messages: list[dict], max_tokens: int = 1024) -> str:
     payload = {
         "model":    SQL_MODEL,
@@ -123,7 +140,16 @@ def _call_ollama(messages: list[dict], max_tokens: int = 1024) -> str:
         json=payload,
         timeout=OLLAMA_TIMEOUT,
     )
-    resp.raise_for_status()
+    
+    # ── FIX: Catch and reveal the ACTUAL error from Ollama ──
+    if resp.status_code != 200:
+        error_details = resp.text
+        raise Exception(
+            f"Ollama returned HTTP {resp.status_code}. "
+            f"Model requested: '{SQL_MODEL}'. "
+            f"Ollama's exact error message: {error_details}"
+        )
+        
     return resp.json()["message"]["content"].strip()
 
 
@@ -177,6 +203,8 @@ def generate_safe_sql(
     if not sql:
         return {"success": False, "error": "Model response contained no valid SQL."}
 
+    sql = _harden_casts(sql)  # Defensively upgrade to TRY_CAST
+
     logger.info("SQL first attempt (%d chars): %s…", len(sql), sql[:100])
 
     # ── Self-repair pass ───────────────────────────────────────────────────────
@@ -198,6 +226,7 @@ def generate_safe_sql(
                 raw_repair = _call_ollama(repair_messages, max_tokens=1024)
                 repaired = _extract_sql(raw_repair)
                 if repaired:
+                    repaired = _harden_casts(repaired)  # Defensively upgrade to TRY_CAST
                     try:
                         conn.execute(f"EXPLAIN {repaired}")
                         logger.info("Self-repair succeeded: %s…", repaired[:100])
