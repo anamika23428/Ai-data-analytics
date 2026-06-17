@@ -1,5 +1,3 @@
-
-
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
@@ -28,8 +26,8 @@ from config import PROMPT_MAX_LENGTH
 from core.llm_router import route_query
 from core.ddl_utils import generate_privacy_safe_ddl, generate_multi_table_ddl
 from core.route_a import run as run_route_a
-from core.sql_engine import generate_safe_sql  
-from core.insight_engine import generate_natural_language_insight 
+from core.sql_engine import generate_safe_sql
+from core.insight_engine import generate_natural_language_insight
 from config import DDL_MAX_COLUMNS
 
 # ── Logging: route decisions visible in terminal ──
@@ -45,21 +43,19 @@ st.set_page_config(page_title="Data Chatbot", page_icon="📊", layout="wide")
 cleanup_old_sessions()
 start_cleanup_daemon()
 
-# ── Session state defaults ────────────────────
-if "session_id"         not in st.session_state: st.session_state.session_id         = None
-if "session_dir"        not in st.session_state: st.session_state.session_dir        = None
-if "duckdb_conn"        not in st.session_state: st.session_state.duckdb_conn        = None
-if "loaded_tables"      not in st.session_state: st.session_state.loaded_tables      = []
-if "quality_reports"    not in st.session_state: st.session_state.quality_reports    = {}
-if "processed_files"    not in st.session_state: st.session_state.processed_files    = set()
-if "file_table_map"     not in st.session_state: st.session_state.file_table_map     = {}
-if "chat_history"       not in st.session_state: st.session_state.chat_history       = []  
-# ── NEW: Dynamic key to force Streamlit to wipe the File Uploader UI ──
-if "uploader_key"       not in st.session_state: st.session_state.uploader_key       = str(uuid.uuid4())
+# ── Session state defaults ────────────────────────────────────────────────────
+if "session_id"      not in st.session_state: st.session_state.session_id      = None
+if "session_dir"     not in st.session_state: st.session_state.session_dir     = None
+if "duckdb_conn"     not in st.session_state: st.session_state.duckdb_conn     = None
+if "loaded_tables"   not in st.session_state: st.session_state.loaded_tables   = []
+if "quality_reports" not in st.session_state: st.session_state.quality_reports = {}
+if "processed_files" not in st.session_state: st.session_state.processed_files = set()
+if "file_table_map"  not in st.session_state: st.session_state.file_table_map  = {}
+if "chat_history"    not in st.session_state: st.session_state.chat_history    = []
+if "uploader_key"    not in st.session_state: st.session_state.uploader_key    = str(uuid.uuid4())
 
 
 def _on_uploader_change():
-    # Fetch files using the dynamic key instead of a static string
     current_names = {f.name for f in (st.session_state.get(st.session_state.uploader_key) or [])}
     removed = st.session_state.processed_files - current_names
     for fname in removed:
@@ -69,21 +65,19 @@ def _on_uploader_change():
 def _reset_session_state():
     st.session_state.session_id      = None
     st.session_state.session_dir     = None
-    
-    # ── NEW: Force close the DuckDB connection to release file locks ──
+
     if st.session_state.duckdb_conn:
         try:
             st.session_state.duckdb_conn.close()
         except Exception:
             pass
-            
+
     st.session_state.duckdb_conn     = None
     st.session_state.loaded_tables   = []
     st.session_state.quality_reports = {}
     st.session_state.processed_files = set()
     st.session_state.file_table_map  = {}
-    st.session_state.chat_history    = []  
-    # ── NEW: Generate a fresh key to instantly wipe the UI uploader widget ──
+    st.session_state.chat_history    = []
     st.session_state.uploader_key    = str(uuid.uuid4())
 
 
@@ -110,11 +104,21 @@ def _remove_file(filename: str):
 #  Chat Message Renderer
 # ═══════════════════════════════════════════════
 def _render_assistant_message(msg: dict):
-    route_icons = {"visualization": "📊", "sql_answer": "🔢", "metadata": "🗂️", "statistical": "📉", "reasoning": "💡"}
-    icon = route_icons.get(msg.get("route"), "❓")
+    route_icons = {
+        "visualization": "📊",
+        "sql_answer":    "🔢",
+        "metadata":      "🗂️",
+        "statistical":   "📉",
+        "reasoning":     "💡",
+    }
+    icon        = route_icons.get(msg.get("route"), "❓")
     conf_colour = {"HIGH": "🟢", "MEDIUM": "🟡", "LOW": "🔴"}.get(msg.get("confidence"), "⚪")
 
-    with st.expander(f"{icon} Route: **{str(msg.get('route')).upper()}** {conf_colour} {msg.get('confidence')}  ·  stage={msg.get('stage')}", expanded=False):
+    with st.expander(
+        f"{icon} Route: **{str(msg.get('route')).upper()}** "
+        f"{conf_colour} {msg.get('confidence')}  ·  stage={msg.get('stage')}",
+        expanded=False,
+    ):
         if msg.get("router_parsed"):
             st.json(msg["router_parsed"])
 
@@ -128,7 +132,8 @@ def _render_assistant_message(msg: dict):
                 st.code(msg["sql"], language="sql")
         if msg.get("val_log"):
             with st.expander("🔍 Validation log"):
-                for line in msg["val_log"]: st.text(line)
+                for line in msg["val_log"]:
+                    st.text(line)
         return
 
     if msg["route"] == "metadata":
@@ -148,9 +153,21 @@ def _render_assistant_message(msg: dict):
 
         col_csv, col_html = st.columns(2)
         with col_csv:
-            st.download_button("⬇️ Download CSV", data=msg["df"].to_csv(index=False).encode("utf-8"), file_name="chart_data.csv", mime="text/csv", key=f"dl_csv_{msg['id']}")
+            st.download_button(
+                "⬇️ Download CSV",
+                data=msg["df"].to_csv(index=False).encode("utf-8"),
+                file_name="chart_data.csv",
+                mime="text/csv",
+                key=f"dl_csv_{msg['id']}",
+            )
         with col_html:
-            st.download_button("⬇️ Download HTML", data=msg["fig"].to_html(include_plotlyjs="cdn").encode("utf-8"), file_name="chart.html", mime="text/html", key=f"dl_html_{msg['id']}")
+            st.download_button(
+                "⬇️ Download HTML",
+                data=msg["fig"].to_html(include_plotlyjs="cdn").encode("utf-8"),
+                file_name="chart.html",
+                mime="text/html",
+                key=f"dl_html_{msg['id']}",
+            )
 
         with st.expander("📋 Raw query result", expanded=False):
             st.dataframe(msg["df"].head(50), use_container_width=True)
@@ -159,12 +176,18 @@ def _render_assistant_message(msg: dict):
         if msg.get("insight"):
             st.markdown(f"**Answer:** {msg['insight']}")
             st.divider()
-            
+
         st.subheader("🔎 Generated SQL")
         st.code(msg["sql"], language="sql")
         st.subheader("📋 Query result (first 50 rows)")
         st.dataframe(msg["df"].head(50), use_container_width=True)
-        st.download_button("Download CSV", data=msg["df"].to_csv(index=False).encode("utf-8"), file_name="query_result.csv", mime="text/csv", key=f"dl_sql_{msg['id']}")
+        st.download_button(
+            "Download CSV",
+            data=msg["df"].to_csv(index=False).encode("utf-8"),
+            file_name="query_result.csv",
+            mime="text/csv",
+            key=f"dl_sql_{msg['id']}",
+        )
 
 
 # ═══════════════════════════════════════════════
@@ -180,30 +203,41 @@ with st.sidebar:
         label="Drop CSV, XLSX, JSON, or TXT",
         type=["csv", "xlsx", "json", "txt"],
         accept_multiple_files=True,
-        key=st.session_state.uploader_key, # ── NEW: Linked to our dynamic wipe key
+        key=st.session_state.uploader_key,
         on_change=_on_uploader_change,
-        label_visibility="collapsed"
+        label_visibility="collapsed",
     )
-    run_button = st.button("▶  Load Files", type="primary", disabled=(not uploaded_files), use_container_width=True)
+    run_button = st.button(
+        "▶  Load Files",
+        type="primary",
+        disabled=(not uploaded_files),
+        use_container_width=True,
+    )
 
     if st.session_state.duckdb_conn and st.session_state.loaded_tables:
         st.divider()
         st.subheader("📁 Loaded Context")
-        
+
         for fname in sorted(st.session_state.processed_files):
             file_tables = st.session_state.file_table_map.get(fname, [])
             st.markdown(f"**{fname}**")
             st.caption(f"Tables: `{', '.join(file_tables)}`")
-            
+
         with st.expander("👀 Preview Data", expanded=False):
             for t in st.session_state.loaded_tables:
                 st.markdown(f"**`{t}`**")
-                st.dataframe(st.session_state.duckdb_conn.execute(f"SELECT * FROM {t} LIMIT 5").df(), use_container_width=True)
-                
+                st.dataframe(
+                    st.session_state.duckdb_conn.execute(f"SELECT * FROM {t} LIMIT 5").df(),
+                    use_container_width=True,
+                )
+
         st.divider()
         if st.button("🗑️ Delete Session", type="secondary", use_container_width=True):
             if st.session_state.session_id:
-                delete_session(session_id=st.session_state.session_id, conn=st.session_state.duckdb_conn)
+                delete_session(
+                    session_id=st.session_state.session_id,
+                    conn=st.session_state.duckdb_conn,
+                )
             _reset_session_state()
             st.rerun()
 
@@ -250,17 +284,17 @@ if run_button and uploaded_files:
             st.session_state.loaded_tables = get_all_tables(conn)
             st.session_state.file_table_map[uploaded_file.name] = new_tables
             status.update(label=f"✅ {uploaded_file.name} ready!", state="complete", expanded=False)
-            
+
     st.rerun()
 
 
-# ── Render the Chat Interface ──
+# ── Render the Chat Interface ─────────────────────────────────────────────────
 if not tables:
     st.title("Welcome to Chat-to-Data 🤖")
     st.info("👈 Please upload and load a data file from the sidebar to begin chatting.")
 else:
     st.title("Chat-to-Data")
-    
+
     for msg in st.session_state.chat_history:
         with st.chat_message(msg["role"]):
             if msg["role"] == "user":
@@ -273,22 +307,30 @@ else:
             st.error(f"Prompt is too long (max {PROMPT_MAX_LENGTH} characters).")
         else:
             st.session_state.chat_history.append({"role": "user", "content": prompt})
-            
+
             with st.chat_message("user"):
                 st.write(prompt)
 
             with st.chat_message("assistant"):
                 with st.spinner("Analyzing..."):
-                    ddl_for_router = generate_multi_table_ddl(conn, tables, redact=False, max_columns=DDL_MAX_COLUMNS) if tables else ""
-                    
-                    if ddl_for_router:
-                        ddl_for_router += "\n\n-- CRITICAL DATA DICTIONARY HINTS --\n"
-                        ddl_for_router += "-- 1. The 'category' column contains multiple sub-categories separated by the '|' symbol.\n"
-                        ddl_for_router += "-- 2. If the user asks to count, list, or name unique categories, you MUST split them using: UNNEST(STRING_SPLIT(category, '|'))\n"
+
+                    # Build DDL for the router (schema only, no row data)
+                    # NOTE: No hardcoded dataset-specific hints here — the improved
+                    # sql_engine and route_a use live DESCRIBE calls to get exact
+                    # column names for any dataset automatically.
+                    ddl_for_router = (
+                        generate_multi_table_ddl(
+                            conn, tables, redact=False, max_columns=DDL_MAX_COLUMNS
+                        )
+                        if tables else ""
+                    )
 
                     routing_result = route_query(
-                        user_prompt=prompt, ddl_schema=ddl_for_router, table_name=", ".join(tables) if tables else "",
-                        sample_rows=None, print_to_terminal=True
+                        user_prompt=prompt,
+                        ddl_schema=ddl_for_router,
+                        table_name=", ".join(tables) if tables else "",
+                        sample_rows=None,
+                        print_to_terminal=True,
                     )
 
                     parsed_route = routing_result.get("parsed") or {}
@@ -298,23 +340,30 @@ else:
 
                     msg_id = str(uuid.uuid4())
                     assistant_msg = {
-                        "role": "assistant",
-                        "id": msg_id,
-                        "route": route_label,
-                        "confidence": confidence,
-                        "stage": route_stage,
-                        "router_parsed": parsed_route
+                        "role":          "assistant",
+                        "id":            msg_id,
+                        "route":         route_label,
+                        "confidence":    confidence,
+                        "stage":         route_stage,
+                        "router_parsed": parsed_route,
                     }
 
                     if not routing_result.get("success"):
-                        assistant_msg["warning"] = f"Router fallback — Error: {routing_result.get('error')}"
+                        assistant_msg["warning"] = (
+                            f"Router fallback — Error: {routing_result.get('error')}"
+                        )
                     elif confidence == "LOW":
-                        assistant_msg["warning"] = "⚠️ The query router is unsure. Proceeding as sql_answer."
+                        assistant_msg["warning"] = (
+                            "⚠️ The query router is unsure. Proceeding as sql_answer."
+                        )
 
+                    # ── Route: metadata ───────────────────────────────────────
                     if route_label == "metadata":
                         tables_data = []
                         for t in tables:
-                            ddl = generate_privacy_safe_ddl(conn, t, redact=False, max_columns=DDL_MAX_COLUMNS)
+                            ddl = generate_privacy_safe_ddl(
+                                conn, t, redact=False, max_columns=DDL_MAX_COLUMNS
+                            )
                             try:
                                 info_df = conn.execute(f"DESCRIBE {t}").df()
                             except Exception:
@@ -323,54 +372,74 @@ else:
                         assistant_msg["tables"] = tables_data
                         _render_assistant_message(assistant_msg)
 
+                    # ── Route: visualization ──────────────────────────────────
                     elif route_label == "visualization":
-                        route_a_result = run_route_a(conn=conn, tables=tables, prompt=prompt, router_intent=parsed_route)
+                        route_a_result = run_route_a(
+                            conn=conn,
+                            tables=tables,
+                            prompt=prompt,
+                            router_intent=parsed_route,
+                        )
                         if not route_a_result.success:
-                            assistant_msg["error"] = f"Visualization failed at stage {route_a_result.stage_reached}: {route_a_result.error}"
+                            assistant_msg["error"] = (
+                                f"Visualization failed at stage "
+                                f"{route_a_result.stage_reached}: {route_a_result.error}"
+                            )
                             assistant_msg["val_log"] = route_a_result.validation_log
-                            assistant_msg["sql"] = route_a_result.sql
+                            assistant_msg["sql"]     = route_a_result.sql
                         else:
                             assistant_msg.update({
-                                "intent": route_a_result.intent,
-                                "sql": route_a_result.sql,
+                                "intent":  route_a_result.intent,
+                                "sql":     route_a_result.sql,
                                 "val_log": route_a_result.validation_log,
-                                "df": route_a_result.df,
-                                "fig": route_a_result.fig
+                                "df":      route_a_result.df,
+                                "fig":     route_a_result.fig,
                             })
                         _render_assistant_message(assistant_msg)
 
+                    # ── Route: sql_answer / statistical / reasoning ───────────
                     else:
-                        sql_result = generate_safe_sql(prompt=prompt, ddl_schema=ddl_for_router, table_name=tables[0] if tables else "", db_session=conn)
+                        sql_result = generate_safe_sql(
+                            prompt=prompt,
+                            ddl_schema=ddl_for_router,
+                            table_name=tables[0] if tables else "",
+                            db_session=conn,   # passed so sql_engine can DESCRIBE tables
+                        )
                         if not sql_result["success"]:
-                            assistant_msg["error"] = f"LLM failed to generate valid SQL: {sql_result['error']}"
+                            assistant_msg["error"] = (
+                                f"LLM failed to generate valid SQL: {sql_result['error']}"
+                            )
                             assistant_msg["sql"] = sql_result.get("sql")
                         else:
                             sql = sql_result["sql"]
                             ok, reason = validate_sql_query(conn, sql, tables)
                             if not ok:
                                 assistant_msg["error"] = reason
-                                assistant_msg["sql"] = sql
+                                assistant_msg["sql"]   = sql
                             else:
                                 try:
                                     df = conn.execute(sql).df()
                                     assistant_msg.update({"sql": sql, "df": df})
-                                    
+
                                     with st.spinner("Generating natural language answer..."):
                                         try:
                                             insight = generate_natural_language_insight(
                                                 prompt=prompt,
                                                 ddl_schema=ddl_for_router,
                                                 sql=sql,
-                                                df=df
+                                                df=df,
                                             )
                                             assistant_msg["insight"] = insight
                                         except Exception as e:
-                                            assistant_msg["warning"] = f"Insight Error: {str(e)}"
-                                            
+                                            assistant_msg["warning"] = (
+                                                f"Insight Error: {str(e)}"
+                                            )
+
                                 except Exception as e:
                                     assistant_msg["error"] = f"Execution error: {e}"
-                                    assistant_msg["sql"] = sql
+                                    assistant_msg["sql"]   = sql
+
                         _render_assistant_message(assistant_msg)
 
             st.session_state.chat_history.append(assistant_msg)
-            st.rerun() # Ensure the page completely refreshes to render the new state
+            st.rerun()
