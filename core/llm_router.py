@@ -33,7 +33,7 @@ def _print_route(result: dict) -> None:
     chart  = parsed.get("chart_type") or "—"
     title  = parsed.get("title") or ""
     expl   = parsed.get("explanation") or ""
-    model  = result.get("model") or "keyword"
+    model  = result.get("model") or "unknown"
     ok     = result.get("success", False)
 
     col = _ROUTE_COLOUR.get(route, _RESET)
@@ -61,112 +61,7 @@ def _print_route(result: dict) -> None:
 
 
 # ══════════════════════════════════════════════
-#  Stage 1 – Keyword pre-filter
-#
-#  Design rules to avoid misrouting:
-#  1. metadata  — only structural/schema questions
-#  2. statistical — only explicit stats terms (outlier, percentile, etc.)
-#  3. visualization — explicit chart/plot words OR aggregation WITH a grouping word
-#                     (but NOT bare aggregations like "what is the total" — those are sql_answer)
-#  4. sql_answer — specific value/ranking lookups WITHOUT a grouping word
-#
-#  Priority order: metadata > statistical > visualization > sql_answer
-#  visualization beats sql_answer because grouped aggregations are better shown as charts.
-#  When no keyword matches → LLM (Stage 2) decides.
-# ══════════════════════════════════════════════
-
-_KEYWORD_PATTERNS: dict[str, list[re.Pattern]] = {
-
-    # ── Metadata: only schema/structure questions ──────────────────────────
-    # These are tight — must be explicitly about columns/schema, NOT data values.
-    "metadata": [
-        re.compile(r"\bhow many (columns?|fields?)\b"),                          # "how many columns" — NOT "how many rows" (that's sql_answer)
-        re.compile(r"\bgive (me )?(the )?(schema|columns?|fields?|structure)\b"),
-        re.compile(r"\bwhat (columns?|fields?|types?|schema)\b"),
-        re.compile(r"\blist (the )?(columns?|fields?)\b"),
-        re.compile(r"\bdescribe (the )?(table|dataset|data|schema)\b"),
-        re.compile(r"\bwhat (are the |is the )?(data ?types?|column names?)\b"),
-        re.compile(r"\bshow (me )?(the )?(schema|structure)\b"),                 # "show the schema" — NOT "show me a bar chart"
-        re.compile(r"\bis there a .+ column\b"),
-        re.compile(r"\bdo you have a .+ (column|field)\b"),
-        re.compile(r"\bwhat (columns?|fields?) (are |is )?(available|present|in (the |this )?(table|dataset|data))"),
-    ],
-
-    # ── Statistical: explicit stats terms only ─────────────────────────────
-    # Keep tight — "average" alone does NOT belong here, it belongs to sql_answer/visualization.
-    "statistical": [
-        re.compile(r"\b(outlier|anomal|unusual|abnormal)\b"),
-        re.compile(r"\b(percentile|quartile|iqr|interquartile)\b"),
-        re.compile(r"\b(standard deviation|std ?dev|variance|spread)\b"),
-        re.compile(r"\b(correlation|z.?score|skewness|kurtosis)\b"),
-        re.compile(r"\b(frequency distribution|histogram buckets?)\b"),
-    ],
-
-    # ── Visualization: explicit chart words OR grouped aggregation ──────────
-    # Rule: aggregation word (avg/sum/count/etc.) MUST be paired with a grouping word
-    # (by/per/across/for each) to route here. Bare "what is the average X" goes to sql_answer.
-    "visualization": [
-        # Explicit chart/plot/graph words — unambiguous
-        re.compile(r"\b(bar|pie|line|scatter|heatmap|histogram)\s?(chart|plot|graph)\b"),
-        re.compile(r"\b(plot|draw|graph|chart|visuali[sz]e|render)\b"),
-        re.compile(r"\bshow (me )?(a |the )?(bar|pie|line|scatter|trend|breakdown) (chart|plot|graph)?\b"),
-        re.compile(r"\btrend (over|across|by|per)\b"),
-        re.compile(r"\bdistribution of\b"),
-        # "compare X by Y" / "breakdown of X by Y" — always visual
-        re.compile(r"\b(compare|breakdown|split)\b.{0,40}\b(by|across|between|per)\b"),
-        # Aggregation + grouping word together → visualization (e.g. "average salary by department")
-        # Requires BOTH an aggregation word AND a grouping word in close proximity.
-        # Without a grouping word (e.g. "what is the total sales") → falls through to sql_answer.
-        re.compile(
-            r"\b(average|avg|total|sum|count|mean|median|max|maximum|min|minimum)\b"
-            r"(?:.(?!\b(what|which|who|is|was|are|were)\b)){0,50}"  # must NOT be a bare question form
-            r"\b(by|per|across|for each|grouped by)\b"
-        ),
-    ],
-
-    # ── SQL Answer: specific lookups, rankings, scalar values ──────────────
-    # These are deliberately narrow — only fire on unambiguous "give me a number/name" queries.
-    # Bare aggregations like "what is the total X" land here (not visualization).
-    "sql_answer": [
-        # Ranking queries — always a table result
-        re.compile(r"\b(top|bottom|highest|lowest|best|worst) \d+\b"),
-        # "who had / which product" — specific lookup
-        re.compile(r"\b(who had|which (product|region|item|category|department|person))\b"),
-        # "how many rows/records" — count query (NOT how many columns → that's metadata)
-        re.compile(r"\bhow many (rows?|records?|entries|observations)\b"),
-        # Explicit calculation requests
-        re.compile(r"\b(calculate|compute|find the|list all)\b(?!.*(columns?|fields?|schema))"),
-        re.compile(r"\bcount of\b(?!.*(columns?|fields?|schema))"),
-        # Bare "what is the total/average/max/min X" WITHOUT a grouping word
-        # Uses a negative lookahead to avoid stealing grouped queries from visualization.
-        re.compile(
-            r"\b(what is the|what was the|give me the)\b.{0,40}"
-            r"\b(total|sum|average|mean|maximum|minimum|max|min|count)\b"
-            r"(?!.{0,60}\b(by|per|across|for each|grouped by)\b)"
-        ),
-    ],
-}
-
-
-def _keyword_route(prompt: str) -> str | None:
-    text = prompt.lower().strip()
-    # Priority: metadata first (structural questions), then statistical (explicit stats),
-    # then visualization (charts + grouped aggregations), then sql_answer (scalar lookups).
-    # Ambiguous queries that don't hit any pattern go to LLM (Stage 2).
-    priority_order = ["metadata", "statistical", "visualization", "sql_answer"]
-    for route in priority_order:
-        for pattern in _KEYWORD_PATTERNS[route]:
-            if pattern.search(text):
-                logger.debug(
-                    "Stage 1 keyword match — route='%s' pattern='%s'",
-                    route, pattern.pattern,
-                )
-                return route
-    return None
-
-
-# ══════════════════════════════════════════════
-#  Stage 2 – Local Ollama LLM system prompt
+#  Local Ollama LLM system prompt
 # ══════════════════════════════════════════════
 
 SYSTEM_PROMPT = """
@@ -280,11 +175,7 @@ def route_query(
     print_to_terminal: bool = True,
 ) -> dict:
     """
-    Route a user query to the correct analytics handler.
-
-    Two-stage pipeline:
-      Stage 1 – Regex keyword match  (no LLM, instant, ~70% of queries)
-      Stage 2 – Local Ollama LLM     (all data stays on your machine)
+    Route a user query to the correct analytics handler using a local Ollama LLM.
 
     Args:
         user_prompt:       The user's natural language question.
@@ -293,7 +184,7 @@ def route_query(
                            one file is loaded in this session.
         table_name:        Comma-separated names of all tables currently
                            loaded in this session.
-        sample_rows:       Optional first-3 rows for LLM context (stage 2 only).
+        sample_rows:       Optional first-3 rows for LLM context.
                            NOTE: only include if your data policy permits it.
         print_to_terminal: If True, pretty-prints the decision to stdout.
 
@@ -301,35 +192,7 @@ def route_query(
         success, stage, parsed (route/confidence/chart_type/…), model, error
     """
 
-    # ── Stage 1: Keyword pre-filter ───────────
-    keyword_route = _keyword_route(user_prompt)
-    if keyword_route is not None:
-        logger.info(
-            "Stage 1 keyword match — route='%s' prompt='%s'",
-            keyword_route, user_prompt[:80],
-        )
-        result = {
-            "success": True,
-            "stage":   "keyword",
-            "parsed": {
-                "route":       keyword_route,
-                "confidence":  "HIGH",
-                "chart_type":  None,
-                "x_axis":      None,
-                "y_axis":      None,
-                "aggregation": "none",
-                "title":       "",
-                "explanation": "Resolved by keyword pre-filter — no LLM call.",
-            },
-            "model":        None,
-            "error":        None,
-            "user_message": "",
-        }
-        if print_to_terminal:
-            _print_route(result)
-        return result
-
-    # ── Stage 2: Local Ollama LLM ─────────────
+    # ── Local Ollama LLM Routing ─────────────
     # Only schema DDL (+ optional sample rows) is sent.
     # Raw data is never included. Ollama runs locally — nothing leaves your machine.
     sample_section = ""
@@ -352,7 +215,7 @@ def route_query(
     ]
 
     logger.info(
-        "Stage 2 LLM routing — model=%s table=%s prompt='%s'",
+        "LLM routing — model=%s table=%s prompt='%s'",
         ROUTER_MODEL, table_name, user_prompt[:80],
     )
 
@@ -366,7 +229,7 @@ def route_query(
             parsed["confidence"] = "MEDIUM"
 
         logger.info(
-            "Stage 2 routing decision — route=%s confidence=%s chart=%s",
+            "Routing decision — route=%s confidence=%s chart=%s",
             parsed.get("route"), parsed.get("confidence"), parsed.get("chart_type"),
         )
 
