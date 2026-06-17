@@ -26,8 +26,10 @@ from config import PROMPT_MAX_LENGTH
 from core.llm_router import route_query
 from core.ddl_utils import generate_privacy_safe_ddl, generate_multi_table_ddl
 from core.route_a import run as run_route_a
-from core.sql_engine import generate_safe_sql
-from core.insight_engine import generate_natural_language_insight
+from core.route_c import run as run_route_c
+from core.route_d import run as run_route_d
+from core.sql_engine import generate_safe_sql  
+from core.insight_engine import generate_natural_language_insight 
 from config import DDL_MAX_COLUMNS
 
 # ── Logging: route decisions visible in terminal ──
@@ -137,12 +139,27 @@ def _render_assistant_message(msg: dict):
         return
 
     if msg["route"] == "metadata":
-        st.subheader("🗂️ Schema Information")
-        for t_data in msg.get("tables", []):
-            with st.expander(f"Table: `{t_data['name']}`", expanded=True):
-                st.code(t_data["ddl"], language="sql")
-                if t_data.get("info_df") is not None:
-                    st.dataframe(t_data["info_df"], use_container_width=True)
+        # ── Schema queries: show DDL + DESCRIBE for each table ──
+        if msg.get("tables"):
+            st.subheader("🗂️ Schema Information")
+            for t_data in msg["tables"]:
+                with st.expander(f"Table: `{t_data['name']}`", expanded=True):
+                    st.code(t_data["ddl"], language="sql")
+                    if t_data.get("info_df") is not None:
+                        st.dataframe(t_data["info_df"], use_container_width=True)
+
+        # ── Keyword-match queries: show plain answer + optional result table ──
+        if msg.get("answer"):
+            st.markdown(msg["answer"])
+        if msg.get("df") is not None:
+            st.dataframe(msg["df"], use_container_width=True)
+            st.download_button(
+                "⬇️ Download CSV",
+                data=msg["df"].to_csv(index=False).encode("utf-8"),
+                file_name="metadata_result.csv",
+                mime="text/csv",
+                key=f"dl_meta_{msg['id']}",
+            )
 
     elif msg["route"] == "visualization":
         with st.expander("🔎 Generated SQL", expanded=False):
@@ -172,7 +189,29 @@ def _render_assistant_message(msg: dict):
         with st.expander("📋 Raw query result", expanded=False):
             st.dataframe(msg["df"].head(50), use_container_width=True)
 
+    elif msg["route"] in ("statistical", "reasoning"):
+        # Route D: Statistical results + AI observation
+        if msg.get("answer"):
+            st.markdown(f"**📊 AI Observation:** {msg['answer']}")
+            st.divider()
+
+        if msg.get("sql"):
+            with st.expander("🔎 Generated SQL", expanded=False):
+                st.code(msg["sql"], language="sql")
+
+        if msg.get("df") is not None:
+            st.subheader("📋 Statistical Results")
+            st.dataframe(msg["df"].head(50), use_container_width=True)
+            st.download_button(
+                "⬇️ Download CSV",
+                data=msg["df"].to_csv(index=False).encode("utf-8"),
+                file_name="statistical_result.csv",
+                mime="text/csv",
+                key=f"dl_stat_{msg['id']}",
+            )
+
     else:
+        # Route B: sql_answer — plain-English answer + SQL + result table
         if msg.get("insight"):
             st.markdown(f"**Answer:** {msg['insight']}")
             st.divider()
@@ -359,17 +398,17 @@ else:
 
                     # ── Route: metadata ───────────────────────────────────────
                     if route_label == "metadata":
-                        tables_data = []
-                        for t in tables:
-                            ddl = generate_privacy_safe_ddl(
-                                conn, t, redact=False, max_columns=DDL_MAX_COLUMNS
-                            )
-                            try:
-                                info_df = conn.execute(f"DESCRIBE {t}").df()
-                            except Exception:
-                                info_df = None
-                            tables_data.append({"name": t, "ddl": ddl, "info_df": info_df})
-                        assistant_msg["tables"] = tables_data
+                        route_c_result = run_route_c(conn=conn, tables=tables, prompt=prompt)
+                        if not route_c_result.success:
+                            assistant_msg["error"] = route_c_result.error or "Route C failed."
+                        else:
+                            assistant_msg["answer"] = route_c_result.answer
+                            # Pass tables payload for the schema DDL renderer (may be None for keyword queries)
+                            if route_c_result.tables:
+                                assistant_msg["tables"] = route_c_result.tables
+                            # Pass dataframe for keyword-match results (unique values, frequency tables, etc.)
+                            if route_c_result.dataframe is not None:
+                                assistant_msg["df"] = route_c_result.dataframe
                         _render_assistant_message(assistant_msg)
 
                     # ── Route: visualization ──────────────────────────────────
@@ -397,7 +436,26 @@ else:
                             })
                         _render_assistant_message(assistant_msg)
 
-                    # ── Route: sql_answer / statistical / reasoning ───────────
+                    elif route_label in ("statistical", "reasoning"):
+                        with st.spinner("Running statistical analysis..."):
+                            route_d_result = run_route_d(
+                                conn=conn,
+                                tables=tables,
+                                prompt=prompt,
+                                ddl_schema=ddl_for_router,
+                                route_label=route_label,
+                            )
+                        if not route_d_result.success:
+                            assistant_msg["error"] = route_d_result.error or "Route D failed."
+                            assistant_msg["sql"] = route_d_result.sql
+                        else:
+                            assistant_msg.update({
+                                "answer": route_d_result.answer,
+                                "sql":    route_d_result.sql,
+                                "df":     route_d_result.dataframe,
+                            })
+                        _render_assistant_message(assistant_msg)
+
                     else:
                         sql_result = generate_safe_sql(
                             prompt=prompt,

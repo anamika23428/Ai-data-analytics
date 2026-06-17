@@ -68,7 +68,12 @@ except ImportError:
 try:
     from config import SQL_MODEL
 except ImportError:
-    SQL_MODEL = "qwen2.5-coder:7b"
+    SQL_MODEL = "qwen2.5-coder:1.5b"   # keep in sync with config.py
+
+
+def _qident(name: str) -> str:
+    """Return a safely double-quoted DuckDB identifier (handles spaces & special chars)."""
+    return '"' + name.replace('"', '""')+'"'  
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -137,13 +142,19 @@ Output ONLY a single JSON object — no text, no markdown, no backticks.
   "y_label":     "<y axis label>"
 }
 
-CRITICAL RULES:
-- "table" MUST be one of the table names listed in the COLUMN DICTIONARY.
-- x_axis, y_axis, group_by, order_by MUST be column names that appear verbatim
-  in the COLUMN DICTIONARY — never invent, shorten, or modify column names.
-- chart_type must be exactly one of: bar, pie, line, scatter, histogram, heatmap
-- aggregation must be exactly one of: sum, avg, count, min, max, none
-- All string values must use double quotes. null values must be JSON null.
+Rules:
+- "table" MUST be one of the table names given in the schema. Pick the table
+  whose columns best match the question. If the question needs columns from
+  more than one table, pick the table with the most relevant columns and the
+  SQL writer will add JOINs as needed.
+- Use ONLY column names that exist in the schema. Never invent columns.
+- chart_type must be one of: bar, pie, line, scatter, histogram, heatmap
+- aggregation must be one of: sum, avg, count, min, max, none
+- All string values must use double quotes.
+- null values must be JSON null (not the string "null").
+- Column names in the JSON MUST match the schema exactly, including spaces
+  (e.g. use "total joining count" not "total_joining_count").
+- If a column name contains spaces, still write it exactly as in the schema.
 """
 
 _INTENT_USER = """\
@@ -240,27 +251,26 @@ def _extract_intent(ddl: str, tables: list[str], question: str, conn=None) -> di
 
 _SQL_SYSTEM = """\
 You are an expert DuckDB SQL writer for data visualization queries.
+Given a schema (which may contain MULTIPLE tables), a primary table name,
+an intent JSON, and a user question, write a single DuckDB SELECT query
+that retrieves the data needed for the chart.
 
-STRICT OUTPUT RULES:
-- Output ONLY the raw SQL query. No markdown, no backticks, no explanation.
-- Start with SELECT or WITH. End with a semicolon.
-- Never use INSERT, UPDATE, DELETE, DROP, CREATE, ALTER, ATTACH, PRAGMA, COPY.
-
-COLUMN RULES — THIS IS CRITICAL:
-- You will be given a COLUMN DICTIONARY listing every table and its exact column names.
-- You MUST use column names EXACTLY as they appear in that dictionary.
-- Never invent, guess, abbreviate, or rename columns.
-- If a column name contains spaces or special characters, wrap it in double-quotes: "My Column".
-
-DUCKDB-SPECIFIC RULES:
-- When using SUM/AVG/COUNT/MIN/MAX, always include the matching GROUP BY clause.
-- Use UNNEST(STRING_SPLIT(col, '|')) to expand pipe-delimited multi-value columns.
-- Use TRY_CAST(col AS DOUBLE) to safely convert text columns to numbers.
-- Use STRFTIME('%Y-%m', col) for month-level date grouping.
-- Column aliases in SELECT can be used in ORDER BY, but NOT in WHERE or HAVING.
-- Do NOT wrap a simple aggregation in an unnecessary subquery.
-- LIMIT always goes after ORDER BY.
-- For JOINs, only use columns that exist in both tables per the COLUMN DICTIONARY.
+Rules:
+- Output ONLY the SQL query. No explanation, no markdown fences, no preamble.
+- Use only SELECT or WITH. Never INSERT, UPDATE, DELETE, DROP, CREATE, ALTER.
+- Reference only tables and columns from the provided schema.
+- Prefer the \"primary table\" given below. If the question requires columns
+  from another table in the schema, you may JOIN to that table using a
+  sensible shared column (e.g. matching id/key column names).
+- ALWAYS double-quote every column name and table name — especially those
+  containing spaces (e.g. \"total joining count\", \"session date\").
+- End with a semicolon.
+- Apply aggregations and GROUP BY as indicated by the intent.
+- Apply ORDER BY and LIMIT as indicated by the intent.
+- Keep the query minimal — only fetch columns needed for the chart.
+- PIPE-DELIMITED COLUMNS: if a column stores multiple values separated by '|'
+  (e.g. category), use UNNEST(STRING_SPLIT(col, '|')) to expand them before
+  grouping or counting.
 """
 
 _SQL_USER = """\
@@ -435,7 +445,7 @@ def _validate_sql(conn, sql: str, table: str, tables: list[str], intent: dict) -
     try:
         target_cols: set[str] = set(
             row[0].lower()
-            for row in conn.execute(f"DESCRIBE {table}").fetchall()
+            for row in conn.execute(f"DESCRIBE {_qident(table)}").fetchall()
         )
 
         other_cols: set[str] = set()
@@ -445,7 +455,7 @@ def _validate_sql(conn, sql: str, table: str, tables: list[str], intent: dict) -
             try:
                 other_cols.update(
                     row[0].lower()
-                    for row in conn.execute(f"DESCRIBE {t}").fetchall()
+                    for row in conn.execute(f"DESCRIBE {_qident(t)}").fetchall()
                 )
             except Exception:
                 pass
