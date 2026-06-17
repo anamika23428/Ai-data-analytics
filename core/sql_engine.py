@@ -33,6 +33,12 @@ COLUMN RULES — THIS IS CRITICAL:
 - Never invent, guess, abbreviate, or rename columns.
 - If a column name contains spaces or special characters, wrap it in double-quotes: "My Column".
 
+MULTI-TABLE & "ENTIRE FILE" QUERIES:
+1. If the user asks about the whole file or all data, use UNION ALL.
+2. CRITICAL FILTER: You MUST read the COLUMN DICTIONARY before adding a table to the UNION. 
+3. If a table DOES NOT have the relevant column (e.g., you need employee names, but the table only has "Session Name", "Track Name", or metrics), YOU MUST SKIP THAT TABLE ENTIRELY.
+4. NEVER write `SELECT name FROM table` unless the exact word "name" is in the dictionary for that specific table. If it uses "EMPNAME" or "Employee Name", use that exactly and alias it (e.g., SELECT "EMPNAME" AS name).
+
 DUCKDB-SPECIFIC RULES:
 - When using SUM/AVG/COUNT/MIN/MAX, always include the matching GROUP BY clause.
 - Use UNNEST(STRING_SPLIT(col, '|')) to expand pipe-delimited multi-value columns.
