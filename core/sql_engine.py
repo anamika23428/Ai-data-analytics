@@ -8,6 +8,29 @@
 #      qwen2.5-coder and asks it to fix the query (one retry, fully local).
 #   4. Removed the hardcoded Amazon 'category|pipe' hint — that was dataset-
 #      specific and confused the model on every other dataset.
+#   5. _harden_casts: bare CAST(...) is auto-upgraded to TRY_CAST(...) so a
+#      single malformed value never crashes the whole query.
+#   6. _fix_decimal_stripping: removes any REPLACE(x, '.', '') the model
+#      generates — it sometimes over-applies the currency/percent cleaning
+#      template to the decimal point too, silently corrupting "4.5" -> "45".
+#   7. Hardening changes are now logged (before/after) so it's visible when
+#      these safety nets actually fire vs. the model writing correct SQL.
+#   8. Ollama timeouts now get a specific, actionable error message instead
+#      of falling into the generic exception handler.
+#
+# KNOWN LIMITATIONS (documented, not yet fixed — see chat history):
+#   - _harden_casts operates on raw SQL text with no awareness of string-literal
+#     boundaries. If a dataset's text contains the literal substring "CAST("
+#     inside a quoted value the model echoes into a WHERE clause, this regex
+#     would incorrectly rewrite inside that literal. Low probability given
+#     real-world data, not addressed here.
+#   - _fix_decimal_stripping assumes '.' is always a decimal point, which is
+#     correct for the US/India-style data this has been tested against, but
+#     would be the WRONG fix for European-formatted numbers where '.' is a
+#     thousands separator. Revisit if you ever load that kind of dataset.
+#   - core/route_a.py's _generate_sql needs the identical _fix_decimal_stripping
+#     + _harden_casts treatment — it generates SQL through the same model and
+#     is equally exposed. Not part of this file; apply there separately.
 
 import logging
 import re
@@ -42,6 +65,8 @@ MULTI-TABLE & "ENTIRE FILE" QUERIES:
 DUCKDB STRING CONVERSION RULES (CRITICAL):
 - To convert currency/price strings to numbers, remove symbols first: TRY_CAST(REPLACE(REPLACE(col, '₹', ''), ',', '') AS DOUBLE).
 - To convert percentage strings to numbers: TRY_CAST(REPLACE(col, '%', '') AS DOUBLE).
+- NEVER remove or replace decimal points ('.') when cleaning numeric columns like ratings or prices, as this alters the underlying numerical value.
+  WRONG: REPLACE(rating, '.', '') turns "4.5" into "45" — this corrupts the value. Do not do this.
 - ALWAYS use TRY_CAST, never plain CAST, when converting any text/VARCHAR column to a numeric or date type for comparison or filtering. A single malformed value (e.g. a stray '|' or empty string) inside a bare CAST will crash the ENTIRE query; TRY_CAST returns NULL for that value instead and lets the rest of the query complete normally.
 
 DUCKDB-SPECIFIC RULES:
@@ -125,6 +150,121 @@ def _harden_casts(sql: str) -> str:
     return re.sub(r"\bCAST\s*\(", "TRY_CAST(", sql, flags=re.IGNORECASE)
 
 
+def _find_matching_paren(s: str, open_idx: int) -> int | None:
+    """Given the index of an opening '(' in s, return the index of its
+    matching closing ')', respecting quoted strings. None if unbalanced."""
+    depth = 0
+    in_single = False
+    in_double = False
+    i = open_idx
+    while i < len(s):
+        ch = s[i]
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        elif ch == "(" and not in_single and not in_double:
+            depth += 1
+        elif ch == ")" and not in_single and not in_double:
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return None
+
+def _split_top_level_args(s: str) -> list[str]:
+    """
+    Split comma-separated SQL arguments at the TOP level only, respecting
+    nested parens and quoted strings, e.g.
+    "REPLACE(a, ','), '.', ''" -> ["REPLACE(a, ',')", " '.'", " ''"]
+    """
+    args = []
+    depth = 0
+    in_single = False
+    in_double = False
+    current = []
+    for ch in s:
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        elif ch == "(" and not in_single and not in_double:
+            depth += 1
+        elif ch == ")" and not in_single and not in_double:
+            depth -= 1
+            
+        if ch == "," and depth == 0 and not in_single and not in_double:
+            args.append("".join(current))
+            current = []
+            continue
+        current.append(ch)
+    args.append("".join(current))
+    return args
+
+_REPLACE_CALL_START = re.compile(r"\bREPLACE\s*\(", re.IGNORECASE)
+
+def _fix_decimal_stripping(sql: str) -> str:
+    """
+    Remove any REPLACE(<expr>, '.', '') call, regardless of nesting depth,
+    WITHOUT corrupting unrelated REPLACE(...) calls elsewhere in the same
+    statement (e.g. two separate chains joined by AND).
+
+    An earlier version of this fix used a single lazy regex
+    (REPLACE\\(.*?, '.', '')), which is unsafe: with two separate REPLACE
+    chains in the same query, the lazy '.*?' can overshoot past the first
+    chain's own closing paren entirely and latch onto a '.'-strip
+    belonging to a SECOND, unrelated expression, corrupting everything in
+    between. This version walks each REPLACE( call's actual balanced
+    parentheses and inspects its real arguments instead of guessing with
+    regex, so it can never cross into an unrelated call.
+    """
+    result = sql
+    while True:
+        changed = False
+        for match in _REPLACE_CALL_START.finditer(result):
+            open_idx = match.end() - 1
+            close_idx = _find_matching_paren(result, open_idx)
+            if close_idx is None:
+                continue
+                
+            inner = result[open_idx + 1: close_idx]
+            args = _split_top_level_args(inner)
+            
+            if len(args) != 3:
+                continue
+                
+            search_arg = args[1].strip()
+            replace_arg = args[2].strip()
+            
+            if search_arg in ("'.'", '"."') and replace_arg in ("''", '""'):
+                expr = args[0].strip()
+                result = result[:match.start()] + expr + result[close_idx + 1:]
+                changed = True
+                break  # string indices shifted — restart the scan
+                
+        if not changed:
+            break
+            
+    return result
+
+
+def _harden_sql(sql: str) -> str:
+    """
+    Apply all deterministic post-generation safety fixes and log when any
+    of them actually change the SQL, so it's visible whether the model is
+    writing correct SQL on its own or relying on these safety nets.
+    """
+    before = sql
+    sql = _fix_decimal_stripping(sql)
+    sql = _harden_casts(sql)
+    if sql != before:
+        logger.info(
+            "SQL hardened — before: %s… | after: %s…",
+            before[:100], sql[:100],
+        )
+    return sql
+
+
 def _call_ollama(messages: list[dict], max_tokens: int = 1024) -> str:
     payload = {
         "model":    SQL_MODEL,
@@ -140,7 +280,7 @@ def _call_ollama(messages: list[dict], max_tokens: int = 1024) -> str:
         json=payload,
         timeout=OLLAMA_TIMEOUT,
     )
-    
+
     # ── FIX: Catch and reveal the ACTUAL error from Ollama ──
     if resp.status_code != 200:
         error_details = resp.text
@@ -149,7 +289,7 @@ def _call_ollama(messages: list[dict], max_tokens: int = 1024) -> str:
             f"Model requested: '{SQL_MODEL}'. "
             f"Ollama's exact error message: {error_details}"
         )
-        
+
     return resp.json()["message"]["content"].strip()
 
 
@@ -196,6 +336,14 @@ def generate_safe_sql(
         )
         logger.error(msg)
         return {"success": False, "error": msg}
+    except requests.exceptions.Timeout:
+        msg = (
+            f"Ollama took longer than {OLLAMA_TIMEOUT}s to respond. The model "
+            f"may still be loading into memory on first use — try again, or "
+            f"raise OLLAMA_TIMEOUT in config.py if this happens consistently."
+        )
+        logger.error(msg)
+        return {"success": False, "error": msg}
     except Exception as e:
         return {"success": False, "error": f"Ollama call failed: {e}"}
 
@@ -203,7 +351,7 @@ def generate_safe_sql(
     if not sql:
         return {"success": False, "error": "Model response contained no valid SQL."}
 
-    sql = _harden_casts(sql)  # Defensively upgrade to TRY_CAST
+    sql = _harden_sql(sql)
 
     logger.info("SQL first attempt (%d chars): %s…", len(sql), sql[:100])
 
@@ -226,7 +374,7 @@ def generate_safe_sql(
                 raw_repair = _call_ollama(repair_messages, max_tokens=1024)
                 repaired = _extract_sql(raw_repair)
                 if repaired:
-                    repaired = _harden_casts(repaired)  # Defensively upgrade to TRY_CAST
+                    repaired = _harden_sql(repaired)
                     try:
                         conn.execute(f"EXPLAIN {repaired}")
                         logger.info("Self-repair succeeded: %s…", repaired[:100])
@@ -238,6 +386,11 @@ def generate_safe_sql(
                         )
                 else:
                     logger.warning("Self-repair produced no valid SQL.")
+            except requests.exceptions.Timeout:
+                logger.warning(
+                    "Self-repair Ollama call timed out after %ss — "
+                    "returning original for validator to handle.", OLLAMA_TIMEOUT
+                )
             except Exception as repair_exc:
                 logger.warning("Self-repair Ollama call failed: %s", repair_exc)
 
