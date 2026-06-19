@@ -17,20 +17,6 @@
 #      these safety nets actually fire vs. the model writing correct SQL.
 #   8. Ollama timeouts now get a specific, actionable error message instead
 #      of falling into the generic exception handler.
-#
-# KNOWN LIMITATIONS (documented, not yet fixed — see chat history):
-#   - _harden_casts operates on raw SQL text with no awareness of string-literal
-#     boundaries. If a dataset's text contains the literal substring "CAST("
-#     inside a quoted value the model echoes into a WHERE clause, this regex
-#     would incorrectly rewrite inside that literal. Low probability given
-#     real-world data, not addressed here.
-#   - _fix_decimal_stripping assumes '.' is always a decimal point, which is
-#     correct for the US/India-style data this has been tested against, but
-#     would be the WRONG fix for European-formatted numbers where '.' is a
-#     thousands separator. Revisit if you ever load that kind of dataset.
-#   - core/route_a.py's _generate_sql needs the identical _fix_decimal_stripping
-#     + _harden_casts treatment — it generates SQL through the same model and
-#     is equally exposed. Not part of this file; apply there separately.
 
 import logging
 import re
@@ -39,6 +25,16 @@ import requests
 from config import OLLAMA_BASE_URL, SQL_MODEL, OLLAMA_TIMEOUT
 
 logger = logging.getLogger(__name__)
+
+# ── ANSI colours ──────────────────────────────────────────────────────────────
+_R    = "\033[0m"
+_BOLD = "\033[1m"
+_BLUE = "\033[94m"
+_GREEN = "\033[92m"
+_YELLOW = "\033[93m"
+_RED  = "\033[91m"
+_DIM  = "\033[2m"
+_CYAN = "\033[96m"
 
 # ── System prompt ──────────────────────────────────────────────────────────────
 _SYSTEM_PROMPT = """\
@@ -65,9 +61,11 @@ MULTI-TABLE & "ENTIRE FILE" QUERIES:
 DUCKDB STRING CONVERSION RULES (CRITICAL):
 - To convert currency/price strings to numbers, remove symbols first: TRY_CAST(REPLACE(REPLACE(col, '₹', ''), ',', '') AS DOUBLE).
 - To convert percentage strings to numbers: TRY_CAST(REPLACE(col, '%', '') AS DOUBLE).
+- To convert comma-separated number strings (like rating_count) to numbers: TRY_CAST(REPLACE(col, ',', '') AS DOUBLE).
 - NEVER remove or replace decimal points ('.') when cleaning numeric columns like ratings or prices, as this alters the underlying numerical value.
   WRONG: REPLACE(rating, '.', '') turns "4.5" into "45" — this corrupts the value. Do not do this.
-- ALWAYS use TRY_CAST, never plain CAST, when converting any text/VARCHAR column to a numeric or date type for comparison or filtering. A single malformed value (e.g. a stray '|' or empty string) inside a bare CAST will crash the ENTIRE query; TRY_CAST returns NULL for that value instead and lets the rest of the query complete normally.
+- ALWAYS use TRY_CAST, never plain CAST, when converting any text/VARCHAR column.
+- ALWAYS clean and TRY_CAST string columns to DOUBLE *before* doing math, filtering in WHERE/HAVING clauses, or sorting in ORDER BY. Never compare a text column directly to a string number (e.g., `rating_count > '1,000'` is WRONG. It must be `TRY_CAST(...) > 1000`).
 
 DUCKDB-SPECIFIC RULES:
 - When using SUM/AVG/COUNT/MIN/MAX, always include the matching GROUP BY clause.
@@ -100,10 +98,6 @@ Output ONLY the raw SQL, nothing else.
 
 
 def _build_column_dict(conn, table_names: list[str]) -> str:
-    """
-    Query DuckDB DESCRIBE for each table and build an explicit column dictionary.
-    This is the key fix — the model sees exact column names and cannot hallucinate.
-    """
     lines = []
     for table in table_names:
         try:
@@ -122,7 +116,6 @@ def _strip_fences(text: str) -> str:
 
 
 def _extract_sql(raw: str) -> str | None:
-    """Pull the first SELECT/WITH block out of the model response."""
     raw = _strip_fences(raw)
     m = re.search(r"(SELECT|WITH)\b[\s\S]*", raw, flags=re.I)
     if not m:
@@ -136,23 +129,10 @@ def _extract_sql(raw: str) -> str | None:
 
 
 def _harden_casts(sql: str) -> str:
-    """
-    Defensively upgrade bare CAST(...) to TRY_CAST(...).
-    This is a read-only analytics tool over arbitrary, often messy
-    uploaded data. A single malformed value (e.g. a stray '|' in what
-    should be a numeric column) should never crash an entire query.
-    TRY_CAST returns NULL for that one row instead of raising, which
-    WHERE/ORDER BY then handle naturally rather than erroring out.
-    \bCAST won't match inside TRY_CAST, since '_' and 'C' are both word
-    characters in regex — there's no boundary between them, so this is
-    safe to run even on SQL that already uses TRY_CAST elsewhere.
-    """
     return re.sub(r"\bCAST\s*\(", "TRY_CAST(", sql, flags=re.IGNORECASE)
 
 
 def _find_matching_paren(s: str, open_idx: int) -> int | None:
-    """Given the index of an opening '(' in s, return the index of its
-    matching closing ')', respecting quoted strings. None if unbalanced."""
     depth = 0
     in_single = False
     in_double = False
@@ -173,11 +153,6 @@ def _find_matching_paren(s: str, open_idx: int) -> int | None:
     return None
 
 def _split_top_level_args(s: str) -> list[str]:
-    """
-    Split comma-separated SQL arguments at the TOP level only, respecting
-    nested parens and quoted strings, e.g.
-    "REPLACE(a, ','), '.', ''" -> ["REPLACE(a, ',')", " '.'", " ''"]
-    """
     args = []
     depth = 0
     in_single = False
@@ -204,20 +179,6 @@ def _split_top_level_args(s: str) -> list[str]:
 _REPLACE_CALL_START = re.compile(r"\bREPLACE\s*\(", re.IGNORECASE)
 
 def _fix_decimal_stripping(sql: str) -> str:
-    """
-    Remove any REPLACE(<expr>, '.', '') call, regardless of nesting depth,
-    WITHOUT corrupting unrelated REPLACE(...) calls elsewhere in the same
-    statement (e.g. two separate chains joined by AND).
-
-    An earlier version of this fix used a single lazy regex
-    (REPLACE\\(.*?, '.', '')), which is unsafe: with two separate REPLACE
-    chains in the same query, the lazy '.*?' can overshoot past the first
-    chain's own closing paren entirely and latch onto a '.'-strip
-    belonging to a SECOND, unrelated expression, corrupting everything in
-    between. This version walks each REPLACE( call's actual balanced
-    parentheses and inspects its real arguments instead of guessing with
-    regex, so it can never cross into an unrelated call.
-    """
     result = sql
     while True:
         changed = False
@@ -240,7 +201,7 @@ def _fix_decimal_stripping(sql: str) -> str:
                 expr = args[0].strip()
                 result = result[:match.start()] + expr + result[close_idx + 1:]
                 changed = True
-                break  # string indices shifted — restart the scan
+                break  
                 
         if not changed:
             break
@@ -249,15 +210,11 @@ def _fix_decimal_stripping(sql: str) -> str:
 
 
 def _harden_sql(sql: str) -> str:
-    """
-    Apply all deterministic post-generation safety fixes and log when any
-    of them actually change the SQL, so it's visible whether the model is
-    writing correct SQL on its own or relying on these safety nets.
-    """
     before = sql
     sql = _fix_decimal_stripping(sql)
     sql = _harden_casts(sql)
     if sql != before:
+        print(f"   {_YELLOW}⚙️ SQL Hardened (Regex safety nets applied){_R}", flush=True)
         logger.info(
             "SQL hardened — before: %s… | after: %s…",
             before[:100], sql[:100],
@@ -273,6 +230,7 @@ def _call_ollama(messages: list[dict], max_tokens: int = 1024) -> str:
         "options":  {
             "temperature": 0.0,
             "num_predict": max_tokens,
+            "num_ctx": 8192,
         },
     }
     resp = requests.post(
@@ -281,7 +239,6 @@ def _call_ollama(messages: list[dict], max_tokens: int = 1024) -> str:
         timeout=OLLAMA_TIMEOUT,
     )
 
-    # ── FIX: Catch and reveal the ACTUAL error from Ollama ──
     if resp.status_code != 200:
         error_details = resp.text
         raise Exception(
@@ -293,27 +250,30 @@ def _call_ollama(messages: list[dict], max_tokens: int = 1024) -> str:
     return resp.json()["message"]["content"].strip()
 
 
+def _print_fail(msg: str) -> None:
+    print(f"\n{_RED}{_BOLD}  ROUTE B FAILED: {msg}{_R}\n", flush=True)
+
+
 def generate_safe_sql(
     prompt: str,
-    ddl_schema: str,      # kept for backward-compatibility
-    table_name: str,      # comma-separated table names (primary first)
-    db_session=None,      # DuckDB connection — used to build live column dict
+    ddl_schema: str,      
+    table_name: str,      
+    db_session=None,      
 ) -> dict:
-    """
-    Generate a valid DuckDB SELECT query for *prompt*.
-
-    Returns:
-        {"success": True,  "sql": "<query>"}
-        {"success": False, "error": "<message>"}
-    """
     conn = db_session
     all_tables = [t.strip() for t in table_name.split(",") if t.strip()] if table_name else []
 
-    # ── Build column dictionary from live DuckDB metadata ─────────────────────
+    print(
+        f"\n{_BOLD}{'═'*55}{_R}\n"
+        f"  {_BLUE}{_BOLD}ROUTE B — DATA ENGINE (SQL){_R}\n"
+        f"  tables={_CYAN}{table_name}{_R}  prompt='{prompt[:60]}'\n"
+        f"{_BOLD}{'═'*55}{_R}",
+        flush=True,
+    )
+
     if conn and all_tables:
         column_dict = _build_column_dict(conn, all_tables)
     else:
-        # Fallback: use the raw DDL text if no live connection
         column_dict = f"(DDL schema — use column names from this only):\n{ddl_schema}"
 
     user_payload = _USER_TEMPLATE.format(
@@ -326,44 +286,51 @@ def generate_safe_sql(
         {"role": "user",   "content": user_payload},
     ]
 
-    # ── First attempt ──────────────────────────────────────────────────────────
+    print(
+        f"\n{_BOLD}{_BLUE}┌── Route B · Stage 1: SQL Generation{_R}\n"
+        f"   model={_DIM}{SQL_MODEL}{_R}",
+        flush=True,
+    )
+
     try:
         raw = _call_ollama(messages)
     except requests.exceptions.ConnectionError:
-        msg = (
-            f"Cannot connect to Ollama at {OLLAMA_BASE_URL}. "
-            "Make sure Ollama is running: `ollama serve`"
-        )
+        msg = f"Cannot connect to Ollama at {OLLAMA_BASE_URL}. Make sure Ollama is running: `ollama serve`"
         logger.error(msg)
+        _print_fail(msg)
         return {"success": False, "error": msg}
     except requests.exceptions.Timeout:
-        msg = (
-            f"Ollama took longer than {OLLAMA_TIMEOUT}s to respond. The model "
-            f"may still be loading into memory on first use — try again, or "
-            f"raise OLLAMA_TIMEOUT in config.py if this happens consistently."
-        )
+        msg = f"Ollama took longer than {OLLAMA_TIMEOUT}s to respond."
         logger.error(msg)
+        _print_fail(msg)
         return {"success": False, "error": msg}
     except Exception as e:
+        _print_fail(f"Ollama call failed: {e}")
         return {"success": False, "error": f"Ollama call failed: {e}"}
 
     sql = _extract_sql(raw)
     if not sql:
+        _print_fail("Model response contained no valid SQL.")
         return {"success": False, "error": "Model response contained no valid SQL."}
 
     sql = _harden_sql(sql)
-
     logger.info("SQL first attempt (%d chars): %s…", len(sql), sql[:100])
+    
+    print(f"   sql={_DIM}{sql[:120]}…{_R}\n{_BOLD}{_BLUE}└──{_R}", flush=True)
 
     # ── Self-repair pass ───────────────────────────────────────────────────────
-    # If DuckDB EXPLAIN rejects the query, send the error back to the model
-    # and ask it to fix the query. One retry, fully local, no data sent anywhere.
     if conn:
+        print(
+            f"\n{_BOLD}{_BLUE}┌── Route B · Stage 2: Validation & Repair{_R}",
+            flush=True,
+        )
         try:
             conn.execute(f"EXPLAIN {sql}")
             logger.info("SQL passed EXPLAIN on first attempt.")
+            print(f"   {_GREEN}EXPLAIN PASS{_R}: SQL is valid\n{_BOLD}{_BLUE}└──{_R}", flush=True)
         except Exception as explain_err:
             logger.warning("SQL failed EXPLAIN (%s) — attempting self-repair…", explain_err)
+            print(f"   {_YELLOW}EXPLAIN FAIL ({explain_err}) — attempting self-repair…{_R}", flush=True)
 
             repair_payload = _REPAIR_TEMPLATE.format(error=str(explain_err), sql=sql)
             repair_messages = messages + [
@@ -379,20 +346,23 @@ def generate_safe_sql(
                         conn.execute(f"EXPLAIN {repaired}")
                         logger.info("Self-repair succeeded: %s…", repaired[:100])
                         sql = repaired
+                        print(f"   {_GREEN}Self-repair succeeded{_R}\n{_BOLD}{_BLUE}└──{_R}", flush=True)
                     except Exception as repair_err:
-                        logger.warning(
-                            "Self-repair also failed EXPLAIN (%s) — "
-                            "returning original for validator to handle.", repair_err
-                        )
+                        logger.warning("Self-repair also failed EXPLAIN (%s)", repair_err)
+                        print(f"   {_RED}Self-repair failed — passing original to validator{_R}\n{_BOLD}{_BLUE}└──{_R}", flush=True)
                 else:
                     logger.warning("Self-repair produced no valid SQL.")
-            except requests.exceptions.Timeout:
-                logger.warning(
-                    "Self-repair Ollama call timed out after %ss — "
-                    "returning original for validator to handle.", OLLAMA_TIMEOUT
-                )
+                    print(f"   {_RED}Self-repair produced no valid SQL{_R}\n{_BOLD}{_BLUE}└──{_R}", flush=True)
             except Exception as repair_exc:
                 logger.warning("Self-repair Ollama call failed: %s", repair_exc)
+                print(f"   {_RED}Self-repair Ollama call failed{_R}\n{_BOLD}{_BLUE}└──{_R}", flush=True)
+
+    print(
+        f"\n{_BOLD}{_GREEN}{'═'*55}{_R}\n"
+        f"  {_GREEN}{_BOLD}ROUTE B COMPLETE ✓{_R}\n"
+        f"{_BOLD}{_GREEN}{'═'*55}{_R}\n",
+        flush=True,
+    )
 
     logger.info("generate_safe_sql returning: %s…", sql[:120])
     return {"success": True, "sql": sql}
