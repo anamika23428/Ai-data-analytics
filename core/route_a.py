@@ -68,7 +68,7 @@ except ImportError:
 try:
     from config import SQL_MODEL
 except ImportError:
-    SQL_MODEL = "qwen2.5-coder:1.5b"   # keep in sync with config.py
+    SQL_MODEL = "qwen2.5-coder:1.5b"  
 
 
 def _qident(name: str) -> str:
@@ -818,3 +818,25 @@ def _print_fail(msg: str) -> None:
         f"\n{_RED}{_BOLD}  ROUTE A FAILED: {msg}{_R}\n",
         flush=True,
     )
+
+
+
+# User question
+#     │
+#     ▼
+# Stage 1: Intent Extraction      (llama3.2:3b)
+#     │   "what chart type? which columns? which table?"
+#     ▼
+# Stage 2: SQL Generation         (qwen2.5-coder:7b)
+#     │   writes a DuckDB SELECT query
+#     ▼
+# Stage 3: 3-Layer Validation
+#     │   Layer 1 → column existence check
+#     │   Layer 2 → DuckDB EXPLAIN (syntax check, no data read)
+#     │   Layer 3 → result shape check (non-empty, correct cols)
+#     ▼
+# Stage 4: DuckDB Execution
+#     │   runs the validated SQL, gets a DataFrame
+#     ▼
+# Stage 5: Plotly Chart Builder
+#         outputs a go.Figure
