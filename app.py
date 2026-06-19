@@ -64,6 +64,7 @@ if "processed_files" not in st.session_state: st.session_state.processed_files =
 if "file_table_map"  not in st.session_state: st.session_state.file_table_map  = {}
 if "chat_history"    not in st.session_state: st.session_state.chat_history    = []
 if "uploader_key"    not in st.session_state: st.session_state.uploader_key    = str(uuid.uuid4())
+if "upload_errors"   not in st.session_state: st.session_state.upload_errors   = []
 
 
 def _on_uploader_change():
@@ -71,6 +72,7 @@ def _on_uploader_change():
     removed = st.session_state.processed_files - current_names
     for fname in removed:
         _remove_file(fname)
+    st.session_state.upload_errors = []
 
 
 def _reset_session_state():
@@ -153,14 +155,14 @@ def _render_assistant_message(msg: dict):
             with st.expander(f"Table: `{t_data['name']}`", expanded=True):
                 st.code(t_data["ddl"], language="sql")
                 if t_data.get("info_df") is not None:
-                    st.dataframe(t_data["info_df"], width="stretch")
+                    st.dataframe(t_data["info_df"], use_container_width=True)
 
     elif msg["route"] == "visualization":
         with st.expander("🔎 Generated SQL", expanded=False):
             st.code(msg["sql"], language="sql")
 
         st.subheader(f"📊 {msg['intent'].get('title', 'Visualization')}")
-        st.plotly_chart(msg["fig"], width="stretch")
+        st.plotly_chart(msg["fig"], use_container_width=True)
 
         col_csv, col_html = st.columns(2)
         with col_csv:
@@ -181,7 +183,7 @@ def _render_assistant_message(msg: dict):
             )
 
         with st.expander("📋 Raw query result", expanded=False):
-            st.dataframe(msg["df"].head(50), width="stretch")
+            st.dataframe(msg["df"].head(50), use_container_width=True)
 
     else:
         if msg.get("insight"):
@@ -193,10 +195,10 @@ def _render_assistant_message(msg: dict):
         total_rows = len(msg["df"])
         if total_rows > 50:
             st.subheader(f"📋 Query result (Showing first 50 of {total_rows} total rows)")
-            st.dataframe(msg["df"].head(50), width="stretch")
+            st.dataframe(msg["df"].head(50), use_container_width=True)
         else:
             st.subheader(f"📋 Query result ({total_rows} rows)")
-            st.dataframe(msg["df"], width="stretch")
+            st.dataframe(msg["df"], use_container_width=True)
         st.download_button(
             "Download CSV",
             data=msg["df"].to_csv(index=False).encode("utf-8"),
@@ -230,6 +232,10 @@ with st.sidebar:
         use_container_width=True, 
     )
 
+    if st.session_state.upload_errors:
+        for err in st.session_state.upload_errors:
+            st.error(f"**Reason:** {err}")
+
     if st.session_state.duckdb_conn and st.session_state.loaded_tables:
         st.divider()
         st.subheader("📁 Loaded Context")
@@ -244,7 +250,7 @@ with st.sidebar:
                 st.markdown(f"**`{t}`**")
                 st.dataframe(
                     st.session_state.duckdb_conn.execute(f"SELECT * FROM {t} LIMIT 5").df(),
-                    width="stretch",
+                    use_container_width=True,
                 )
 
         st.divider()
@@ -271,6 +277,7 @@ if run_button and uploaded_files:
         st.session_state.session_dir = session_dir
 
     conn = get_or_create_connection(st.session_state)
+    st.session_state.upload_errors = []
 
     for uploaded_file in uploaded_files:
         if uploaded_file.name in st.session_state.processed_files:
@@ -280,7 +287,7 @@ if run_button and uploaded_files:
             ok, reason = validate_file(uploaded_file)
             if not ok:
                 status.update(label=f"❌ {uploaded_file.name} rejected", state="error")
-                st.error(reason)
+                st.session_state.upload_errors.append(f"**{uploaded_file.name}**: {reason}")
                 continue
 
             file_path = save_uploaded_file(st.session_state.session_dir, uploaded_file)
@@ -289,7 +296,7 @@ if run_button and uploaded_files:
                 new_tables, warnings = load_file_into_duckdb(file_path, conn, existing)
             except Exception as e:
                 status.update(label=f"❌ Error loading {uploaded_file.name}", state="error")
-                st.error(str(e))
+                st.session_state.upload_errors.append(f"**{uploaded_file.name}**: {e}")
                 continue
 
             for table_name in new_tables:
