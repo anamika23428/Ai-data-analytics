@@ -43,7 +43,7 @@ DDL_MAX_COLUMNS = 50
 OLLAMA_BASE_URL = "http://localhost:11434"
 
 # Seconds before we give up waiting for Ollama to respond
-OLLAMA_TIMEOUT = 120  # Increased slightly to give the Insight model time to read larger data
+OLLAMA_TIMEOUT = 180  # Increased slightly to give the Insight model time to read larger data
 
 # ─────────────────────────────────────────────
 #  Query Router (llm_router.py) settings
