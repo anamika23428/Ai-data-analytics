@@ -76,6 +76,8 @@ DUCKDB-SPECIFIC RULES:
 - When using SUM/AVG/COUNT/MIN/MAX, always include the matching GROUP BY clause.
 - If the COLUMN DICTIONARY marks a column as [DELIMITED with 'X'], you MUST ALWAYS expand it using UNNEST(STRING_SPLIT(col, 'X')) before doing SELECT DISTINCT, COUNT, GROUP BY, or filtering. Never select or group the raw joined string.
 - Column aliases defined in SELECT can be used in ORDER BY, but NOT in WHERE or HAVING.
+- If you use math operators (<, >, =) on a text/VARCHAR column, you MUST ALWAYS wrap the column in TRY_CAST(... AS DOUBLE) first. Never compare a string directly to an integer.
+- If you use aggregation functions like SUM() or AVG(), you MUST wrap the column in TRY_CAST(... AS DOUBLE). Never attempt to SUM() or AVG() a raw VARCHAR.
 - LIMIT always goes after ORDER BY.
 """
 
@@ -98,6 +100,7 @@ Here is the broken query:
 {sql}
 
 Write a corrected DuckDB SQL query that fixes this error exactly.
+CRITICAL: If the error says "Referenced column not found" and provides "Candidate bindings", you MUST replace your hallucinated column name with one of the exact Candidate bindings provided in the error message!
 Output ONLY the raw SQL, nothing else.
 """
 
@@ -376,44 +379,71 @@ def generate_safe_sql(
     print(f"   sql={_DIM}{sql[:120]}…{_R}\n{_BOLD}{_BLUE}└──{_R}", flush=True)
 
     # ── Self-repair pass ───────────────────────────────────────────────────────
+# ── Self-repair pass (Upgraded to 3 Attempts) ──────────────────────────────
     if conn:
         print(
             f"\n{_BOLD}{_BLUE}┌── Route B · Stage 2: Validation & Repair{_R}",
             flush=True,
         )
-        try:
-            conn.execute(f"EXPLAIN {sql}")
-            logger.info("SQL passed EXPLAIN on first attempt.")
-            print(f"   {_GREEN}EXPLAIN PASS{_R}: SQL is valid\n{_BOLD}{_BLUE}└──{_R}", flush=True)
-        except Exception as explain_err:
-            logger.warning("SQL failed EXPLAIN (%s) — attempting self-repair…", explain_err)
-            print(f"   {_YELLOW}EXPLAIN FAIL ({explain_err}) — attempting self-repair…{_R}", flush=True)
+        
+        max_repairs = 3
+        # Create a working copy of messages to track conversation history across retries
+        repair_messages = list(messages)
 
-            repair_payload = _REPAIR_TEMPLATE.format(error=str(explain_err), sql=sql)
-            repair_messages = messages + [
-                {"role": "assistant", "content": sql},
-                {"role": "user",      "content": repair_payload},
-            ]
+        for attempt in range(1, max_repairs + 1):
             try:
-                raw_repair = _call_ollama(repair_messages, max_tokens=1024)
-                repaired = _extract_sql(raw_repair)
-                if repaired:
-                    repaired = _harden_sql(repaired)
-                    try:
-                        conn.execute(f"EXPLAIN {repaired}")
-                        logger.info("Self-repair succeeded: %s…", repaired[:100])
-                        sql = repaired
-                        print(f"   {_GREEN}Self-repair succeeded{_R}\n{_BOLD}{_BLUE}└──{_R}", flush=True)
-                    except Exception as repair_err:
-                        logger.warning("Self-repair also failed EXPLAIN (%s)", repair_err)
-                        print(f"   {_RED}Self-repair failed — passing original to validator{_R}\n{_BOLD}{_BLUE}└──{_R}", flush=True)
+                # Try to execute EXPLAIN on the current SQL
+                conn.execute(f"EXPLAIN {sql}")
+                
+                # If it succeeds, log success and break out of the loop
+                if attempt == 1:
+                    logger.info("SQL passed EXPLAIN on first attempt.")
+                    print(f"   {_GREEN}EXPLAIN PASS{_R}: SQL is valid\n{_BOLD}{_BLUE}└──{_R}", flush=True)
                 else:
-                    logger.warning("Self-repair produced no valid SQL.")
-                    print(f"   {_RED}Self-repair produced no valid SQL{_R}\n{_BOLD}{_BLUE}└──{_R}", flush=True)
-            except Exception as repair_exc:
-                logger.warning("Self-repair Ollama call failed: %s", repair_exc)
-                print(f"   {_RED}Self-repair Ollama call failed{_R}\n{_BOLD}{_BLUE}└──{_R}", flush=True)
+                    logger.info("Self-repair succeeded: %s…", sql[:100])
+                    print(f"   {_GREEN}Self-repair succeeded (Attempt {attempt}/{max_repairs}){_R}\n{_BOLD}{_BLUE}└──{_R}", flush=True)
+                break
+                
+            except Exception as explain_err:
+                # If it's the final attempt, we stop trying and exit the loop
+                if attempt == max_repairs:
+                    logger.warning("Self-repair also failed EXPLAIN (%s)", explain_err)
+                    print(f"   {_RED}Self-repair failed after {max_repairs} attempts — passing original to validator{_R}\n{_BOLD}{_BLUE}└──{_R}", flush=True)
+                    break
+                
+                # Log the failure and state that we are attempting a repair
+                if attempt == 1:
+                    logger.warning("SQL failed EXPLAIN (%s) — attempting self-repair…", explain_err)
+                    print(f"   {_YELLOW}EXPLAIN FAIL ({explain_err}) — attempting self-repair (Attempt 1/{max_repairs})…{_R}", flush=True)
+                else:
+                    logger.warning("Self-repair failed EXPLAIN (%s) — attempting self-repair %d/%d…", explain_err, attempt, max_repairs)
+                    print(f"   {_YELLOW}Self-repair failed ({explain_err}) — attempting self-repair (Attempt {attempt}/{max_repairs})…{_R}", flush=True)
 
+                # Format the error payload
+                repair_payload = _REPAIR_TEMPLATE.format(error=str(explain_err), sql=sql)
+                
+                # Append the failed SQL and the DuckDB error to the ongoing conversation history
+                # so the model knows what it already tried
+                repair_messages.append({"role": "assistant", "content": sql})
+                repair_messages.append({"role": "user", "content": repair_payload})
+                
+                try:
+                    # Ask Ollama for the fix
+                    raw_repair = _call_ollama(repair_messages, max_tokens=1024)
+                    repaired = _extract_sql(raw_repair)
+                    
+                    if repaired:
+                        # Harden the new SQL and loop back up to EXPLAIN it
+                        sql = _harden_sql(repaired)
+                    else:
+                        logger.warning("Self-repair produced no valid SQL.")
+                        print(f"   {_RED}Self-repair produced no valid SQL{_R}\n{_BOLD}{_BLUE}└──{_R}", flush=True)
+                        break
+                        
+                except Exception as repair_exc:
+                    logger.warning("Self-repair Ollama call failed: %s", repair_exc)
+                    print(f"   {_RED}Self-repair Ollama call failed{_R}\n{_BOLD}{_BLUE}└──{_R}", flush=True)
+                    break
     print(
         f"\n{_BOLD}{_GREEN}{'═'*55}{_R}\n"
         f"  {_GREEN}{_BOLD}ROUTE B COMPLETE ✓{_R}\n"
