@@ -17,6 +17,10 @@
 #      these safety nets actually fire vs. the model writing correct SQL.
 #   8. Ollama timeouts now get a specific, actionable error message instead
 #      of falling into the generic exception handler.
+#   9. _detect_delimiter: _build_column_dict now flags internally-delimited
+#      VARCHAR columns (e.g. a pipe-joined "category" hierarchy) directly in
+#      the column dictionary, so the model knows to UNNEST(STRING_SPLIT(...))
+#      instead of treating the whole joined string as one literal value.
 
 import logging
 import re
@@ -65,11 +69,12 @@ DUCKDB STRING CONVERSION RULES (CRITICAL):
 - NEVER remove or replace decimal points ('.') when cleaning numeric columns like ratings or prices, as this alters the underlying numerical value.
   WRONG: REPLACE(rating, '.', '') turns "4.5" into "45" — this corrupts the value. Do not do this.
 - ALWAYS use TRY_CAST, never plain CAST, when converting any text/VARCHAR column.
+- Never include the '%' symbol in mathematical comparisons in the WHERE/HAVING clause (e.g., use > 50 instead of > 50%).
 - ALWAYS clean and TRY_CAST string columns to DOUBLE *before* doing math, filtering in WHERE/HAVING clauses, or sorting in ORDER BY. Never compare a text column directly to a string number (e.g., `rating_count > '1,000'` is WRONG. It must be `TRY_CAST(...) > 1000`).
 
 DUCKDB-SPECIFIC RULES:
 - When using SUM/AVG/COUNT/MIN/MAX, always include the matching GROUP BY clause.
-- Use UNNEST(STRING_SPLIT(col, '|')) to expand pipe-delimited multi-value columns.
+- If the COLUMN DICTIONARY marks a column as [DELIMITED with 'X'], you MUST ALWAYS expand it using UNNEST(STRING_SPLIT(col, 'X')) before doing SELECT DISTINCT, COUNT, GROUP BY, or filtering. Never select or group the raw joined string.
 - Column aliases defined in SELECT can be used in ORDER BY, but NOT in WHERE or HAVING.
 - LIMIT always goes after ORDER BY.
 """
@@ -96,14 +101,66 @@ Write a corrected DuckDB SQL query that fixes this error exactly.
 Output ONLY the raw SQL, nothing else.
 """
 
+# ── Delimiter detection ─────────────────────────────────────────────────────
+_DELIMITER_CANDIDATES = ["|", ";", "/", ">"]
+_DELIMITER_MIN_RATIO = 0.5
+_DELIMITER_SAMPLE_LIMIT = 200
+
+
+def _detect_delimiter(conn, table_name: str, col: str) -> str | None:
+    """
+    Check whether a VARCHAR column's values are internally delimited
+    (e.g. "Computers&Accessories|Cables|USBCables"). Without this, the
+    model has no way to know a column needs UNNEST(STRING_SPLIT(...))
+    instead of a direct equality/IN/DISTINCT match, and will silently
+    generate SQL that treats the full joined string as one value.
+    """
+    escaped = f'"{col}"'
+    try:
+        sample = conn.execute(
+            f"SELECT {escaped} FROM {table_name} "
+            f"WHERE {escaped} IS NOT NULL LIMIT {_DELIMITER_SAMPLE_LIMIT}"
+        ).fetchall()
+    except Exception:
+        return None
+
+    values = [str(r[0]) for r in sample if r[0] is not None]
+    if not values:
+        return None
+
+    for delim in _DELIMITER_CANDIDATES:
+        hits = sum(1 for v in values if delim in v)
+        if hits / len(values) >= _DELIMITER_MIN_RATIO:
+            return delim
+    return None
+
 
 def _build_column_dict(conn, table_names: list[str]) -> str:
+    """
+    Query DuckDB DESCRIBE for each table and build an explicit column
+    dictionary. VARCHAR/TEXT columns are additionally checked for internal
+    delimiters (e.g. a pipe-joined category hierarchy) and flagged inline
+    so the model knows to UNNEST(STRING_SPLIT(...)) rather than treat the
+    full joined string as one literal value.
+    """
     lines = []
     for table in table_names:
         try:
             rows = conn.execute(f"DESCRIBE {table}").fetchall()
-            col_list = ", ".join(f'"{r[0]}" ({r[1]})' for r in rows)
-            lines.append(f'Table "{table}": [ {col_list} ]')
+            col_parts = []
+            for r in rows:
+                col_name, col_type = r[0], r[1]
+                entry = f'"{col_name}" ({col_type})'
+                if any(t in col_type.upper() for t in ("VARCHAR", "TEXT", "CHAR")):
+                    delim = _detect_delimiter(conn, table, col_name)
+                    if delim:
+                        entry += (
+                            f" [DELIMITED with '{delim}' — ALWAYS expand using "
+                            f"UNNEST(STRING_SPLIT(\"{col_name}\", '{delim}')) before "
+                            f"doing SELECT DISTINCT, GROUP BY, or filtering]"
+                        )
+                col_parts.append(entry)
+            lines.append(f'Table "{table}": [ {", ".join(col_parts)} ]')
         except Exception as e:
             lines.append(f'Table "{table}": (could not describe — {e})')
     return "\n".join(lines)
