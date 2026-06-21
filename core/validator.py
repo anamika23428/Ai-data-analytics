@@ -1,4 +1,3 @@
-
 import json
 import csv
 import io
@@ -145,12 +144,30 @@ def _validate_text_file(
         )
 
     # ── Check 5: Printability / entropy check ─────────────────
+    # FIX: Decode as text first and check decoded *characters*, not raw
+    # bytes. Checking raw bytes against the ASCII 32-126 range incorrectly
+    # flags valid UTF-8 files as "binary" whenever they contain non-ASCII
+    # characters (accented names, currency symbols, emoji, non-English
+    # text, etc.) — those legitimately encode as multi-byte sequences with
+    # bytes outside the printable ASCII range. JSON/CSV/TXT files with
+    # such content were being wrongly rejected.
     if len(file_bytes) > 0:
+        try:
+            decoded_sample = file_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            try:
+                decoded_sample = file_bytes.decode("latin-1")
+            except Exception:
+                return False, (
+                    f"'{uploaded_file.name}' could not be decoded as text. "
+                    f"Please upload a real {suffix[1:].upper()} file."
+                )
+
         printable_count = sum(
-            1 for b in file_bytes
-            if b == 9 or b == 10 or b == 13 or 32 <= b <= 126
+            1 for ch in decoded_sample
+            if ch in ("\t", "\n", "\r") or ch.isprintable()
         )
-        printable_ratio = printable_count / len(file_bytes)
+        printable_ratio = printable_count / len(decoded_sample) if decoded_sample else 1.0
 
         if printable_ratio < PRINTABLE_THRESHOLD:
             return False, (

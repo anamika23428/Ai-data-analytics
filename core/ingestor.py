@@ -12,6 +12,7 @@
 # ─────────────────────────────────────────────
 
 import re
+import json
 import pandas as pd
 from pathlib import Path
 import duckdb
@@ -53,7 +54,7 @@ def load_file_into_duckdb(
     if suffix in (".csv", ".txt"):
         tables = [_load_csv(conn, file_path, existing_tables, warnings)]
     elif suffix == ".json":
-        tables = [_load_json(conn, file_path, existing_tables, warnings)]
+        tables = _load_json(conn, file_path, existing_tables, warnings)
     elif suffix == ".xlsx":
         tables = _load_excel_all_sheets(conn, file_path, existing_tables, warnings)
     else:
@@ -116,19 +117,169 @@ def _load_csv(conn, file_path, existing_tables, warnings):
 
 def _load_json(conn, file_path, existing_tables, warnings):
     table_name = _resolve_table_name(file_path.stem, existing_tables, warnings)
+
+    if not _try_load_json_document(conn, table_name, file_path):
+        if not _try_load_json_ndjson(conn, table_name, file_path):
+            if not _try_load_json_recovered(conn, table_name, file_path):
+                raise ValueError(
+                    f"Failed to parse JSON file {file_path.name}: not valid JSON, "
+                    f"NDJSON, or a recoverable sequence of JSON records."
+                )
+
+    # The JSON may be a "wrapper" object whose keys are each an array of
+    # records, e.g. {"employees": [...], "performance": [...]}. DuckDB
+    # loads that as ONE row with LIST-typed columns instead of real rows.
+    # Detect that shape and explode it into one table per array.
+    return _split_multi_array_json(conn, table_name, file_path, existing_tables, warnings)
+
+
+def _try_load_json_document(conn, table_name, file_path) -> bool:
+    """Standard path: a single JSON document (object or array)."""
     try:
         conn.execute(f"""
             CREATE OR REPLACE TABLE {table_name} AS
             SELECT * FROM read_json_auto({_safe_path(file_path)})
         """)
+        return True
     except duckdb.Error:
-        # Fallback for complex/nested JSON arrays
+        return False
+
+
+def _try_load_json_ndjson(conn, table_name, file_path) -> bool:
+    """NDJSON / JSON Lines (one JSON object per line)."""
+    try:
+        conn.execute(f"""
+            CREATE OR REPLACE TABLE {table_name} AS
+            SELECT * FROM read_json_auto({_safe_path(file_path)}, format='newline_delimited')
+        """)
+        return True
+    except duckdb.Error:
+        pass
+
+    try:
+        df = pd.read_json(file_path, lines=True)
+        conn.execute(f"CREATE OR REPLACE TABLE {table_name} AS SELECT * FROM df")
+        return True
+    except Exception:
+        pass
+
+    try:
+        df = pd.read_json(file_path)
+        conn.execute(f"CREATE OR REPLACE TABLE {table_name} AS SELECT * FROM df")
+        return True
+    except Exception:
+        return False
+
+
+def _try_load_json_recovered(conn, table_name, file_path) -> bool:
+    """
+    Malformed-but-recoverable JSON: a sequence of JSON values that isn't
+    wrapped in `[ ]` and/or has stray commas between records, e.g.
+        {"id":1,"name":"A"},
+        {"id":2,"name":"B"},
+    This is neither valid single-document JSON nor valid NDJSON, but the
+    individual records are well-formed, so we can recover them by scanning
+    the raw text for back-to-back JSON values.
+    """
+    try:
+        records = _recover_json_records(file_path)
+        if not records:
+            return False
+        df = pd.json_normalize(records)
+        conn.execute(f"CREATE OR REPLACE TABLE {table_name} AS SELECT * FROM df")
+        return True
+    except Exception:
+        return False
+
+
+def _split_multi_array_json(conn, table_name, file_path, existing_tables, warnings) -> list[str]:
+    """
+    If the loaded JSON resulted in a single row whose columns are
+    themselves LIST-typed (arrays of records) — e.g. the file was shaped
+    like {"employees": [...], "performance": [...]} — explode each list
+    column into its own real table, mirroring how multi-sheet Excel files
+    become multiple tables. Returns the final list of table name(s).
+    """
+    row_count = conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
+    columns_info = conn.execute(f"PRAGMA table_info('{table_name}')").fetchall()
+
+    if row_count != 1 or not columns_info:
+        return [table_name]
+
+    list_cols = [
+        col_name for _, col_name, col_type, *_ in columns_info
+        if col_type.upper().startswith("LIST") or col_type.endswith("[]")
+    ]
+    scalar_cols = [
+        col_name for _, col_name, col_type, *_ in columns_info
+        if col_name not in list_cols
+    ]
+
+    if not list_cols:
+        return [table_name]
+
+    base_stem = file_path.stem
+    created = []
+    for col_name in list_cols:
+        escaped_col = f'"{col_name}"'
+        sub_table = _resolve_table_name(f"{base_stem}_{col_name}", existing_tables, warnings)
         try:
-            df = pd.read_json(file_path)
-            conn.execute(f"CREATE OR REPLACE TABLE {table_name} AS SELECT * FROM df")
-        except Exception as e:
-            raise ValueError(f"Failed to parse JSON file {file_path.name}: {e}")
-    return table_name
+            conn.execute(f"""
+                CREATE OR REPLACE TABLE {sub_table} AS
+                SELECT unnest({escaped_col}, recursive := true)
+                FROM {table_name}
+            """)
+            created.append(sub_table)
+        except duckdb.Error as e:
+            warnings.append(
+                f"⚠️ Could not expand `{col_name}` from {file_path.name} into its own table ({e})."
+            )
+            existing_tables.remove(sub_table)
+
+    if not created:
+        # Nothing could be expanded; fall back to the original single table.
+        return [table_name]
+
+    if scalar_cols:
+        warnings.append(
+            f"⚠️ {file_path.name}: top-level field(s) {', '.join(scalar_cols)} "
+            f"were not arrays and were dropped when splitting into separate tables."
+        )
+
+    conn.execute(f"DROP TABLE IF EXISTS {table_name}")
+    if table_name in existing_tables:
+        existing_tables.remove(table_name)
+
+    return created
+
+
+def _recover_json_records(file_path) -> list:
+    """
+    Scan raw text for a sequence of well-formed JSON values, tolerating
+    separators (commas, whitespace, newlines) between them and a missing
+    enclosing array. Returns a list of the decoded values (dicts/lists/etc).
+    """
+    text = Path(file_path).read_text(encoding="utf-8", errors="strict")
+    decoder = json.JSONDecoder()
+    records = []
+    i = 0
+    n = len(text)
+
+    while i < n:
+        # Skip whitespace and stray separators between records.
+        while i < n and (text[i].isspace() or text[i] in ",[]"):
+            i += 1
+        if i >= n:
+            break
+        try:
+            obj, end = decoder.raw_decode(text, i)
+        except json.JSONDecodeError:
+            # Can't make progress from here; stop with what we've recovered.
+            break
+        records.append(obj)
+        i = end
+
+    return records
 
 
 def _load_excel_all_sheets(conn, file_path, existing_tables, warnings):
