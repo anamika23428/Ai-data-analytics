@@ -44,6 +44,14 @@ from config import (
 )
 from core.ddl_utils import generate_privacy_safe_ddl, generate_multi_table_ddl
 
+# ── Reuse the SAME SQL engine internals as core/sql_engine.py ─────────────────
+# (delimiter-aware column dictionary builder + the TRY_CAST / decimal-strip
+#  hardening safety nets) so Route A and Route B never drift out of sync.
+from core.sql_engine import (
+    _build_column_dict as _se_build_column_dict,
+    _harden_sql,
+)
+
 logger = logging.getLogger(__name__)
 
 # ── ANSI colours ──────────────────────────────────────────────────────────────
@@ -96,25 +104,16 @@ class RouteAResult:
 #  Shared helper — build a column dictionary from live DuckDB metadata
 # ══════════════════════════════════════════════════════════════════════════════
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  Shared helper — build a column dictionary from live DuckDB metadata
+#
+#  NOTE: this now delegates straight to core.sql_engine._build_column_dict so
+#  Route A sees the exact same column dictionary as Route B — including the
+#  [DELIMITED with 'X'] flags for pipe/semicolon-joined VARCHAR columns.
+# ══════════════════════════════════════════════════════════════════════════════
+
 def _build_column_dict(conn, tables: list[str]) -> str:
-    """
-    Call DuckDB DESCRIBE for each table and return a formatted string like:
-
-        Table "sales": [ "product" (VARCHAR), "revenue" (DOUBLE), ... ]
-        Table "customers": [ "id" (INTEGER), "name" (VARCHAR), ... ]
-
-    Injecting this into LLM prompts means the model sees exact column names
-    and cannot hallucinate ones that don't exist.
-    """
-    lines = []
-    for t in tables:
-        try:
-            rows = conn.execute(f"DESCRIBE {t}").fetchall()
-            col_list = ", ".join(f'"{r[0]}" ({r[1]})' for r in rows)
-            lines.append(f'Table "{t}": [ {col_list} ]')
-        except Exception as e:
-            lines.append(f'Table "{t}": (could not describe — {e})')
-    return "\n".join(lines)
+    return _se_build_column_dict(conn, tables)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -129,7 +128,7 @@ Output ONLY a single JSON object — no text, no markdown, no backticks.
 
 {
   "table":       "<name of the table that best answers the question>",
-  "chart_type":  "<bar|pie|line|scatter|histogram|heatmap>",
+  "chart_type":  "<bar|pie|donut|line|area|scatter|histogram|heatmap|box|funnel|treemap>",
   "x_axis":      "<column name exactly as in COLUMN DICTIONARY, or null>",
   "y_axis":      "<column name exactly as in COLUMN DICTIONARY, or null>",
   "aggregation": "<sum|avg|count|min|max|none>",
@@ -148,7 +147,13 @@ Rules:
   more than one table, pick the table with the most relevant columns and the
   SQL writer will add JOINs as needed.
 - Use ONLY column names that exist in the schema. Never invent columns.
-- chart_type must be one of: bar, pie, line, scatter, histogram, heatmap
+- chart_type must be one of: bar, pie, donut, line, area, scatter, histogram, heatmap, box, funnel, treemap
+- If the user explicitly names a chart/graph type in their question (e.g. "pie chart",
+  "line graph", "scatter plot", "box plot", "donut chart", "area chart", "treemap",
+  "funnel"), you MUST use that exact chart_type — never substitute "bar" instead.
+- If the user just says "graph" or "chart" or "visualize" with no specific type named,
+  pick whichever chart_type best fits the data and question (e.g. a trend over time → line,
+  a part-to-whole comparison → pie, a distribution → histogram).
 - aggregation must be one of: sum, avg, count, min, max, none
 - All string values must use double quotes.
 - null values must be JSON null (not the string "null").
@@ -165,6 +170,67 @@ Available tables: {tables}
 
 User question: {question}
 """
+
+
+# Order matters: more specific terms (e.g. "donut") are checked before the
+# generic ones they could otherwise be mistaken for (e.g. "pie").
+_CHART_KEYWORDS: list[tuple[str, str]] = [
+    (r"\bdonut\b", "donut"),
+    (r"\bpie\s*(chart|graph)?\b", "pie"),
+    (r"\btreemap\b", "treemap"),
+    (r"\bfunnel\b", "funnel"),
+    (r"\bbox\s*(plot|chart)?\b", "box"),
+    (r"\bheatmap\b", "heatmap"),
+    (r"\bhistogram\b", "histogram"),
+    (r"\bscatter\s*(plot|chart)?\b", "scatter"),
+    (r"\barea\s*(chart|graph)?\b", "area"),
+    (r"\bline\s*(chart|graph)?\b", "line"),
+    (r"\bbar\s*(chart|graph)?\b", "bar"),
+]
+
+
+def _detect_explicit_chart_type(question: str) -> str | None:
+    """
+    Safety net for when a user explicitly names a chart/graph type
+    ("show me a pie chart of ...", "line graph of ...", "scatter plot
+    between ..."). The small local intent model sometimes ignores this
+    and defaults to 'bar' — this regex check catches it and always wins.
+    """
+    q = question.lower()
+    for pattern, chart_type in _CHART_KEYWORDS:
+        if re.search(pattern, q):
+            return chart_type
+    return None
+
+
+# Some small local models put a computed expression like "average(quantity)"
+# or "AVG(quantity)" directly into x_axis/y_axis/group_by/order_by instead of
+# the plain column name "quantity" + aggregation:"avg". That breaks Layer 1
+# validation (the expression isn't a real column) even though the SQL itself
+# may be fine. This strips the wrapper and recovers the real column + agg.
+_AGG_WRAP_RE = re.compile(
+    r'^\s*(avg|average|sum|total|count|min|minimum|max|maximum)\s*\(\s*"?'
+    r'([^()"]+?)"?\s*\)\s*$',
+    re.IGNORECASE,
+)
+_AGG_WORD_TO_CODE = {
+    "avg": "avg", "average": "avg",
+    "sum": "sum", "total": "sum",
+    "count": "count",
+    "min": "min", "minimum": "min",
+    "max": "max", "maximum": "max",
+}
+
+
+def _unwrap_agg_column(col: str | None) -> tuple[str | None, str | None]:
+    """Return (base_column_name, inferred_aggregation) — aggregation is
+    None if `col` wasn't wrapped in a function call."""
+    if not col:
+        return col, None
+    m = _AGG_WRAP_RE.match(col)
+    if not m:
+        return col, None
+    return m.group(2).strip(), _AGG_WORD_TO_CODE.get(m.group(1).lower())
 
 
 def _extract_intent(ddl: str, tables: list[str], question: str, conn=None) -> dict:
@@ -220,10 +286,33 @@ def _extract_intent(ddl: str, tables: list[str], question: str, conn=None) -> di
     # Normalise chart_type and aggregation
     intent["chart_type"]  = str(intent.get("chart_type",  "bar")).lower()
     intent["aggregation"] = str(intent.get("aggregation", "none")).lower()
-    if intent["chart_type"] not in ("bar", "pie", "line", "scatter", "histogram", "heatmap"):
+    _VALID_CHART_TYPES = (
+        "bar", "pie", "donut", "line", "area", "scatter",
+        "histogram", "heatmap", "box", "funnel", "treemap",
+    )
+    if intent["chart_type"] not in _VALID_CHART_TYPES:
         intent["chart_type"] = "bar"
     if intent["aggregation"] not in ("sum", "avg", "count", "min", "max", "none"):
         intent["aggregation"] = "none"
+
+    # Unwrap any axis the model expressed as a function call, e.g.
+    # y_axis: "average(quantity)" -> y_axis: "quantity", aggregation: "avg"
+    for axis_key in ("x_axis", "y_axis", "group_by", "order_by"):
+        base, inferred_agg = _unwrap_agg_column(intent.get(axis_key))
+        if base != intent.get(axis_key):
+            print(
+                f"   {_YELLOW}Unwrapped {axis_key} '{intent.get(axis_key)}' -> '{base}'{_R}",
+                flush=True,
+            )
+            intent[axis_key] = base
+            if inferred_agg and intent["aggregation"] == "none":
+                intent["aggregation"] = inferred_agg
+
+    # If the user explicitly named a chart/graph type in plain English,
+    # that always wins over the model's guess (handles "any kind of graph").
+    explicit_chart = _detect_explicit_chart_type(question)
+    if explicit_chart:
+        intent["chart_type"] = explicit_chart
 
     # Resolve / validate the chosen table against the actual list of tables
     chosen_table = str(intent.get("table") or "").strip()
@@ -266,11 +355,28 @@ Rules:
   containing spaces (e.g. \"total joining count\", \"session date\").
 - End with a semicolon.
 - Apply aggregations and GROUP BY as indicated by the intent.
+- ALWAYS alias an aggregated column with the PLAIN column name from the intent
+  (e.g. AVG("quantity") AS "quantity"), never a function-call-shaped alias
+  like AVG("quantity") AS "average(quantity)". The chart builder matches
+  output columns against the intent's x_axis/y_axis by plain name.
 - Apply ORDER BY and LIMIT as indicated by the intent.
 - Keep the query minimal — only fetch columns needed for the chart.
 - PIPE-DELIMITED COLUMNS: if a column stores multiple values separated by '|'
   (e.g. category), use UNNEST(STRING_SPLIT(col, '|')) to expand them before
   grouping or counting.
+
+DUCKDB STRING CONVERSION RULES (CRITICAL):
+- To convert currency/price strings to numbers, remove symbols first: TRY_CAST(REPLACE(REPLACE(col, '₹', ''), ',', '') AS DOUBLE).
+- To convert percentage strings to numbers: TRY_CAST(REPLACE(col, '%', '') AS DOUBLE).
+- To convert comma-separated number strings (like rating_count) to numbers: TRY_CAST(REPLACE(col, ',', '') AS DOUBLE).
+- NEVER remove or replace decimal points ('.') when cleaning numeric columns like ratings or prices, as this alters the underlying numerical value.
+  WRONG: REPLACE(rating, '.', '') turns "4.5" into "45" — this corrupts the value. Do not do this.
+- ALWAYS use TRY_CAST, never plain CAST, when converting any text/VARCHAR column.
+- Never include the '%' symbol in mathematical comparisons in the WHERE/HAVING clause (e.g., use > 50 instead of > 50%).
+- ALWAYS clean and TRY_CAST string columns to DOUBLE *before* doing math, filtering in WHERE/HAVING clauses, or sorting in ORDER BY.
+- If the COLUMN DICTIONARY marks a column as [DELIMITED with 'X'], ALWAYS expand it using
+  UNNEST(STRING_SPLIT(col, 'X')) before SELECT DISTINCT, COUNT, GROUP BY, or filtering.
+- LIMIT always goes after ORDER BY.
 """
 
 _SQL_USER = """\
@@ -297,6 +403,7 @@ Here is the broken query:
 {sql}
 
 Write a corrected DuckDB SQL query that fixes this error exactly.
+CRITICAL: If the error says "Referenced column not found" and provides "Candidate bindings", you MUST replace your hallucinated column name with one of the exact Candidate bindings provided in the error message!
 Output ONLY the raw SQL, nothing else.
 """
 
@@ -352,7 +459,7 @@ def _generate_sql(
         "model":    SQL_MODEL,
         "messages": messages,
         "stream":   False,
-        "options":  {"temperature": 0.0, "num_predict": 1024},  # was 512
+        "options":  {"temperature": 0.0, "num_predict": 1024, "num_ctx": 8192},
     }
 
     print(
@@ -374,48 +481,59 @@ def _generate_sql(
         print(f"   {_RED}No valid SQL extracted{_R}\n{_BOLD}{_BLUE}└──{_R}", flush=True)
         return None
 
+    # Same regex safety nets as sql_engine.py: TRY_CAST enforcement +
+    # decimal-point-stripping fix, so both routes harden SQL identically.
+    sql = _harden_sql(sql)
     logger.info("SQL first attempt: %s…", sql[:100])
 
-    # ── Self-repair pass ───────────────────────────────────────────────────────
+    # ── Self-repair pass (3 attempts — same as sql_engine.py) ─────────────────
     if conn:
-        try:
-            conn.execute(f"EXPLAIN {sql}")
-            # EXPLAIN passed — SQL is syntactically valid
-        except Exception as explain_err:
-            print(
-                f"   {_YELLOW}SQL failed EXPLAIN ({explain_err}) — trying self-repair…{_R}",
-                flush=True,
-            )
-            repair_msg = _SQL_REPAIR.format(error=str(explain_err), sql=sql)
-            repair_messages = messages + [
-                {"role": "assistant", "content": sql},
-                {"role": "user",      "content": repair_msg},
-            ]
+        max_repairs = 3
+        repair_messages = list(messages)
+
+        for attempt in range(1, max_repairs + 1):
             try:
-                repair_payload = {**payload, "messages": repair_messages}
-                repair_resp = requests.post(
-                    f"{OLLAMA_BASE_URL}/api/chat",
-                    json=repair_payload,
-                    timeout=OLLAMA_TIMEOUT,
+                conn.execute(f"EXPLAIN {sql}")
+                if attempt > 1:
+                    print(f"   {_GREEN}Self-repair succeeded (Attempt {attempt}/{max_repairs}){_R}", flush=True)
+                    logger.info("Self-repair succeeded: %s…", sql[:100])
+                break
+            except Exception as explain_err:
+                if attempt == max_repairs:
+                    print(
+                        f"   {_RED}Self-repair failed after {max_repairs} attempts ({explain_err}) — "
+                        f"passing original to validator{_R}",
+                        flush=True,
+                    )
+                    logger.warning("Self-repair exhausted (%s)", explain_err)
+                    break
+
+                print(
+                    f"   {_YELLOW}SQL failed EXPLAIN ({explain_err}) — "
+                    f"self-repair attempt {attempt}/{max_repairs}…{_R}",
+                    flush=True,
                 )
-                repair_resp.raise_for_status()
-                repaired = _extract_sql_from_response(repair_resp.json()["message"]["content"])
-                if repaired:
-                    try:
-                        conn.execute(f"EXPLAIN {repaired}")
-                        sql = repaired
-                        print(f"   {_GREEN}Self-repair succeeded{_R}", flush=True)
-                        logger.info("Self-repair succeeded: %s…", sql[:100])
-                    except Exception as repair_err:
-                        print(
-                            f"   {_RED}Self-repair also failed ({repair_err}) — "
-                            f"passing original to validator{_R}",
-                            flush=True,
-                        )
-                else:
-                    print(f"   {_RED}Self-repair produced no SQL{_R}", flush=True)
-            except Exception as repair_exc:
-                print(f"   {_RED}Self-repair call failed: {repair_exc}{_R}", flush=True)
+                repair_msg = _SQL_REPAIR.format(error=str(explain_err), sql=sql)
+                repair_messages.append({"role": "assistant", "content": sql})
+                repair_messages.append({"role": "user", "content": repair_msg})
+
+                try:
+                    repair_payload = {**payload, "messages": repair_messages}
+                    repair_resp = requests.post(
+                        f"{OLLAMA_BASE_URL}/api/chat",
+                        json=repair_payload,
+                        timeout=OLLAMA_TIMEOUT,
+                    )
+                    repair_resp.raise_for_status()
+                    repaired = _extract_sql_from_response(repair_resp.json()["message"]["content"])
+                    if repaired:
+                        sql = _harden_sql(repaired)
+                    else:
+                        print(f"   {_RED}Self-repair produced no SQL{_R}", flush=True)
+                        break
+                except Exception as repair_exc:
+                    print(f"   {_RED}Self-repair call failed: {repair_exc}{_R}", flush=True)
+                    break
 
     print(f"   sql={_DIM}{sql[:120]}…{_R}\n{_BOLD}{_BLUE}└──{_R}", flush=True)
     return sql
@@ -464,6 +582,9 @@ def _validate_sql(conn, sql: str, table: str, tables: list[str], intent: dict) -
             col = intent.get(axis)
             if not col:
                 continue
+            # Defense in depth: if a wrapped expression like "average(quantity)"
+            # ever reaches here, validate the real underlying column instead.
+            col, _ = _unwrap_agg_column(col)
             col_l = col.lower()
             if col_l in target_cols:
                 continue
@@ -557,15 +678,26 @@ def _build_chart(df: pd.DataFrame, intent: dict) -> go.Figure:
     y_label    = intent.get("y_label") or y_col or ""
     group_col  = intent.get("group_by")
 
-    # Resolve columns case-insensitively against actual DataFrame columns
+    # Resolve columns case-insensitively against actual DataFrame columns.
+    # Also tolerant of an aggregate-shaped alias (e.g. "average(quantity)")
+    # in case the SQL model didn't follow the plain-alias instruction.
     cols_lower = {c.lower(): c for c in df.columns}
+    agg = intent.get("aggregation") or "none"
 
     def _resolve(col):
         if col is None:
             return None
         if col in df.columns:
             return col
-        return cols_lower.get(col.lower())
+        hit = cols_lower.get(col.lower())
+        if hit:
+            return hit
+        if agg != "none":
+            for candidate in (f"{agg}({col})", f"{agg}_{col}"):
+                hit = cols_lower.get(candidate.lower())
+                if hit:
+                    return hit
+        return None
 
     x_col     = _resolve(x_col)
     y_col     = _resolve(y_col)
@@ -594,27 +726,31 @@ def _build_chart(df: pd.DataFrame, intent: dict) -> go.Figure:
             else:
                 fig = _fallback_bar(df, title)
 
-        elif chart_type == "pie":
+        elif chart_type in ("pie", "donut"):
             names_col  = x_col or (df.columns[0] if len(df.columns) >= 1 else None)
             values_col = y_col or (df.columns[1] if len(df.columns) >= 2 else None)
             if names_col and values_col:
-                fig = px.pie(df, names=names_col, values=values_col, title=title)
+                fig = px.pie(
+                    df, names=names_col, values=values_col, title=title,
+                    hole=0.45 if chart_type == "donut" else 0.0,
+                )
             else:
                 fig = _fallback_bar(df, title)
 
-        elif chart_type == "line":
+        elif chart_type in ("line", "area"):
             if x_col and y_col:
                 try:
                     df[x_col] = pd.to_datetime(df[x_col])
                     df = df.sort_values(x_col)
                 except Exception:
                     pass
-                fig = px.line(
+                chart_fn = px.area if chart_type == "area" else px.line
+                fig = chart_fn(
                     df, x=x_col, y=y_col,
                     color=group_col,
                     title=title,
                     labels={x_col: x_label, y_col: y_label},
-                    markers=True,
+                    markers=True if chart_type == "line" else False,
                 )
             else:
                 fig = _fallback_bar(df, title)
@@ -649,6 +785,35 @@ def _build_chart(df: pd.DataFrame, intent: dict) -> go.Figure:
                     title=title or "Correlation Heatmap",
                     color_continuous_scale="RdBu_r",
                     zmin=-1, zmax=1,
+                )
+            else:
+                fig = _fallback_bar(df, title)
+
+        elif chart_type == "box":
+            if y_col:
+                fig = px.box(
+                    df, x=x_col, y=y_col,
+                    color=group_col,
+                    title=title,
+                    labels={y_col: y_label, **({x_col: x_label} if x_col else {})},
+                )
+            else:
+                fig = _fallback_bar(df, title)
+
+        elif chart_type == "funnel":
+            names_col  = x_col or (df.columns[0] if len(df.columns) >= 1 else None)
+            values_col = y_col or (df.columns[1] if len(df.columns) >= 2 else None)
+            if names_col and values_col:
+                fig = px.funnel(df, x=values_col, y=names_col, title=title)
+            else:
+                fig = _fallback_bar(df, title)
+
+        elif chart_type == "treemap":
+            path_col   = x_col or (df.columns[0] if len(df.columns) >= 1 else None)
+            values_col = y_col or (df.columns[1] if len(df.columns) >= 2 else None)
+            if path_col and values_col:
+                fig = px.treemap(
+                    df, path=[path_col], values=values_col, title=title,
                 )
             else:
                 fig = _fallback_bar(df, title)
