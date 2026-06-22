@@ -1,5 +1,15 @@
 # ─────────────────────────────────────────────
-# core/session_mgr.py  –  Temp folder management
+#  core/session_mgr.py  –  Temp folder management
+#  (Consolidated — this used to also exist as core/session_mgr_1.py,
+#   a near-duplicate with TTL/logging refinements. Merged into one file
+#   so app.py and scripts/check_sessions.py share a single source of truth.)
+#
+#  Features:
+#    1. TTL based on last-accessed time → active sessions are never deleted mid-use
+#    2. Windows PermissionError on rmtree surfaced as warning
+#    3. delete_session()   → wipe entire session folder + DuckDB conn
+#    4. delete_file_from_session() → remove one file + drop its DuckDB tables
+#    5. Full terminal logging for every create / delete event (stdout + file)
 # ─────────────────────────────────────────────
 
 import uuid
@@ -12,6 +22,8 @@ from config import TMP_BASE_DIR, SESSION_TTL_MINUTES
 import logging
 
 # ── Logger setup ──────────────────────────────
+# Writes to both the terminal (stdout via StreamHandler) and a persistent log
+# file under TMP_BASE_DIR so operators can watch `tail -f` in production.
 
 _cleanup_daemon_started = False
 
@@ -19,6 +31,7 @@ logger = logging.getLogger("core.session_mgr")
 logger.setLevel(logging.DEBUG)
 
 if not logger.handlers:
+    # Console handler — visible in the terminal where `streamlit run` is executed
     ch = logging.StreamHandler()
     ch.setLevel(logging.DEBUG)
     ch.setFormatter(logging.Formatter(
@@ -27,190 +40,208 @@ if not logger.handlers:
     ))
     logger.addHandler(ch)
 
+    # File handler — persistent log under the session base dir
+    try:
+        Path(TMP_BASE_DIR).mkdir(parents=True, exist_ok=True)
+        log_path = Path(TMP_BASE_DIR) / "session_cleanup.log"
+        fh = logging.FileHandler(log_path, encoding="utf-8")
+        fh.setLevel(logging.DEBUG)
+        fh.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)-8s  %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        ))
+        logger.addHandler(fh)
+    except Exception:
+        pass  # if we can't write the log file, terminal output is still active
+
 
 # ── Public API ────────────────────────────────
 
 def create_session() -> tuple[str, Path]:
-    """Create a new private session folder."""
-    session_id = str(uuid.uuid4())
+    """Create a new private session folder. Returns (session_id, folder_path)."""
+    session_id  = str(uuid.uuid4())
     session_dir = Path(TMP_BASE_DIR) / session_id
-
     session_dir.mkdir(parents=True, exist_ok=True)
     _touch_session(session_dir)
-
-    logger.info(f"SESSION CREATED   id={session_id} path={session_dir}")
-
+    logger.info(f"SESSION CREATED   id={session_id}  path={session_dir}")
     return session_id, session_dir
 
 
 def get_session_dir(session_id: str) -> Path | None:
-    """Return session directory if exists, else None."""
     session_dir = Path(TMP_BASE_DIR) / session_id
-
     if session_dir.exists():
         _touch_session(session_dir)
         return session_dir
-
     return None
 
 
 def save_uploaded_file(session_dir: Path, uploaded_file) -> Path:
-    """Save uploaded file (Streamlit) to session folder."""
+    """Save the uploaded Streamlit file to disk. Returns the saved path."""
     destination = session_dir / uploaded_file.name
-
     destination.write_bytes(uploaded_file.read())
     uploaded_file.seek(0)
-
     _touch_session(session_dir)
-
     logger.debug(f"FILE SAVED        path={destination}")
-
     return destination
 
 
 def delete_file_from_session(
     session_dir: Path,
     filename: str,
-    conn,                       # duckdb connection (optional)
+    conn,           # duckdb.DuckDBPyConnection | None
     table_names: list[str],
 ) -> list[str]:
     """
-    Delete a file from session folder and drop its DuckDB tables.
-    Returns list of successfully dropped tables.
+    Remove one uploaded file from the session folder and drop its DuckDB tables.
+
+    Args:
+        session_dir:  Path to the session directory.
+        filename:     The original uploaded filename (e.g. "sales.csv").
+        conn:         Live DuckDB connection (can be None).
+        table_names:  List of DuckDB table names that were created from this file.
+
+    Returns:
+        List of table names that were successfully dropped.
     """
-    dropped_tables = []
+    dropped: list[str] = []
 
+    # 1. Drop DuckDB tables
+    if conn is not None:
+        for table in table_names:
+            try:
+                conn.execute(f"DROP TABLE IF EXISTS {table}")
+                dropped.append(table)
+                logger.info(f"TABLE DROPPED     table={table}  file={filename}")
+            except Exception as exc:
+                logger.warning(f"Could not drop table {table}: {exc}")
+
+    # 2. Delete file from disk
     file_path = session_dir / filename
-
-    # Delete file
     if file_path.exists():
         try:
             file_path.unlink()
             logger.info(f"FILE DELETED      path={file_path}")
-        except Exception as e:
-            logger.exception(f"Error deleting file {file_path}: {e}")
+        except Exception as exc:
+            logger.warning(f"Could not delete file {file_path}: {exc}")
 
-    # Drop tables in DuckDB
-    if conn:
-        for table in table_names:
-            try:
-                conn.execute(f"DROP TABLE IF EXISTS {table}")
-                dropped_tables.append(table)
-                logger.info(f"TABLE DROPPED     table={table}")
-            except Exception as e:
-                logger.exception(f"Error dropping table {table}: {e}")
-
-    return dropped_tables
+    return dropped
 
 
 def delete_session(session_id: str, conn) -> bool:
     """
-    Completely delete a session: close DuckDB connection and delete folder.
-    """
-    session_dir = Path(TMP_BASE_DIR) / session_id
+    Completely destroy a session: close DuckDB connection and wipe the folder.
 
-    # Close DB connection
-    if conn:
+    Args:
+        session_id: The UUID string of the session.
+        conn:       The DuckDB connection to close (can be None).
+
+    Returns:
+        True if the folder was deleted successfully, False otherwise.
+    """
+    # 1. Close DuckDB connection first (avoids Windows file-lock)
+    if conn is not None:
         try:
             conn.close()
-            logger.info(f"DB CONNECTION CLOSED for session={session_id}")
-        except Exception as e:
-            logger.exception(f"Error closing DB connection: {e}")
+            logger.info(f"DUCKDB CLOSED     session={session_id}")
+        except Exception as exc:
+            logger.warning(f"Could not close DuckDB for session {session_id}: {exc}")
 
-    # Delete folder
-    if session_dir.exists():
-        try:
-            shutil.rmtree(session_dir)
-            logger.info(f"SESSION DELETED    id={session_id} path={session_dir}")
-            return True
-        except Exception as e:
-            logger.exception(f"Error deleting session {session_id}: {e}")
-            return False
+    # 2. Remove session folder
+    session_dir = Path(TMP_BASE_DIR) / session_id
+    failures: list[str] = []
+    _try_delete(session_dir, failures)
 
-    return False
+    if failures:
+        logger.error(f"SESSION DELETE FAILED  id={session_id}  path={session_dir}")
+        return False
+
+    logger.info(f"SESSION DELETED   id={session_id}  path={session_dir}")
+    return True
 
 
 def cleanup_old_sessions() -> list[str]:
     """
-    Delete session folders inactive for longer than TTL.
-    Returns folders that could NOT be deleted.
+    Delete session folders that have been idle for longer than SESSION_TTL_MINUTES.
+    Returns a list of any folders that could NOT be deleted.
     """
-    failures = []
     base = Path(TMP_BASE_DIR)
-
     if not base.exists():
         return []
 
-    now = time.time()
-    ttl_seconds = SESSION_TTL_MINUTES * 60
+    cutoff   = time.time() - (SESSION_TTL_MINUTES * 60)
+    failures = []
+    removed  = 0
 
     for session_dir in base.iterdir():
         if not session_dir.is_dir():
             continue
 
-        access_file = session_dir / ".last_accessed"
+        timestamp_file = session_dir / ".last_accessed"
+
+        if not timestamp_file.exists():
+            _try_delete(session_dir, failures)
+            removed += 1
+            continue
 
         try:
-            if access_file.exists():
-                last_access = float(access_file.read_text().strip())
-            else:
-                # fallback: use folder modified time
-                last_access = session_dir.stat().st_mtime
+            last_accessed = float(timestamp_file.read_text())
+        except Exception:
+            logger.warning(f"Could not read timestamp for {session_dir.name}; treating as expired")
+            _try_delete(session_dir, failures)
+            removed += 1
+            continue
 
-            age = now - last_access
+        if last_accessed < cutoff:
+            idle_minutes = (time.time() - last_accessed) / 60
+            logger.info(
+                f"SESSION EXPIRED   id={session_dir.name}  "
+                f"idle={idle_minutes:.1f}min  ttl={SESSION_TTL_MINUTES}min"
+            )
+            _try_delete(session_dir, failures)
+            removed += 1
 
-            if age > ttl_seconds:
-                logger.info(f"CLEANUP: deleting expired session {session_dir}")
-                _try_delete(session_dir, failures)
-
-        except Exception as e:
-            failures.append(str(session_dir))
-            logger.exception(f"Error checking session {session_dir}: {e}")
+    if removed:
+        logger.info(f"CLEANUP DONE      removed={removed}  failures={len(failures)}")
+    else:
+        logger.debug("CLEANUP RUN       no expired sessions found")
 
     return failures
 
 
 def start_cleanup_daemon(interval_seconds: int = 60):
     """
-    Start background cleanup thread.
-    Runs periodically forever.
+    Start a background daemon thread that periodically runs cleanup_old_sessions().
+    Safe to call multiple times — daemon is only started once per process.
     """
     global _cleanup_daemon_started
-
     if _cleanup_daemon_started:
         return
 
-    def _worker():
+    def _loop():
         while True:
             try:
-                failures = cleanup_old_sessions()
-                if failures:
-                    logger.warning(f"CLEANUP FAILURES: {failures}")
-            except Exception as e:
-                logger.exception(f"Cleanup daemon error: {e}")
-
+                cleanup_old_sessions()
+            except Exception as exc:
+                logger.exception(f"Cleanup daemon error: {exc}")
             time.sleep(interval_seconds)
 
-    thread = threading.Thread(target=_worker, daemon=True)
-    thread.start()
-
+    t = threading.Thread(target=_loop, daemon=True, name="session_cleanup")
+    t.start()
     _cleanup_daemon_started = True
-
-    logger.info("CLEANUP DAEMON STARTED")
+    logger.info(f"CLEANUP DAEMON    started  interval={interval_seconds}s")
 
 
 # ── Private helpers ───────────────────────────
 
 def _touch_session(session_dir: Path):
-    """Update last accessed timestamp."""
+    """Write the current Unix timestamp as the last-accessed marker."""
     try:
         (session_dir / ".last_accessed").write_text(str(time.time()))
-    except Exception as e:
-        logger.exception(f"Error touching session {session_dir}: {e}")
+    except Exception as exc:
+        logger.warning(f"Could not touch session {session_dir}: {exc}")
 
 
 def _try_delete(session_dir: Path, failures: list[str]):
-    """Try deleting a folder safely."""
     try:
         shutil.rmtree(session_dir)
         logger.info(f"FOLDER REMOVED    path={session_dir}")
