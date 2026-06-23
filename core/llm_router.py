@@ -84,105 +84,85 @@ OUTPUT FORMAT — Return EXACTLY this JSON structure, nothing else:
   "explanation": "<one sentence explaining your routing decision>"
 }
 
+VALID route values: "visualization", "sql_answer", "metadata", "statistical", "reasoning"
+Do NOT use any other route label (e.g. do NOT use "analytical", "lookup", "record_lookup").
 
 ROUTE LABELS — Choose exactly one:
 
 "visualization"
-→ User explicitly asks for a chart, graph, plot, dashboard, or visual output.
-
+→ User explicitly asks for a chart, graph, plot, or visual output.
+→ Use ONLY when the user specifically requests a visual. Do NOT use
+  just because aggregation is involved.
 Examples:
-- "plot temperature over time"
-- "bar chart of employee count by department"
-- "pie chart of defect types"
-- "show a histogram of ages"
+  "bar chart of sales by category"
+  "pie chart of orders by city"
+  "plot revenue over time"
+  "show a histogram of ages"
 
-Use ONLY when the user specifically requests a visual representation.
-Do NOT use just because aggregation is involved.
-
-
-"record_lookup"
-→ User wants specific records, rows, filtering, searching, or simple factual retrieval.
-
+"sql_answer"
+→ User wants specific records, rows, or simple direct lookups.
+→ Use when the answer is a direct retrieval — NOT a ranking or group comparison.
 Examples:
-- "show employees in London"
-- "find orders above 500"
-- "which machine has serial number X"
-- "what is the highest salary"
-- "list patients older than 60"
-
-Use when the answer comes from directly retrieving existing records,
-not comparing groups or performing broader analysis.
-
+  "show all orders above 500"
+  "list customers from New York"
+  "what is the email of customer 101"
+  "show all completed sessions"
 
 "metadata"
-→ User wants to understand the dataset structure, schema, columns,
-data types, categories, or unique values.
-
+→ User wants to explore the dataset structure, schema, columns, data types,
+  or what values/categories exist in the data.
+→ Use whenever the user is asking WHAT EXISTS in the data, not computing metrics.
 Examples:
-- "what columns are available"
-- "show the schema"
-- "what values exist in status"
-- "list distinct departments"
-- "how many unique categories are there"
-- "what are the data types"
+  "what columns are in the customers table"
+  "list all unique cities"
+  "what are the distinct product categories"
+  "how many unique products are there"
+  "what values exist in the status column"
+  "most common city"
+  "top 5 frequent categories"
+  "show the schema"
+  "what data types are used"
 
-Use whenever the user is exploring the data itself rather than deriving
-new analytical metrics.
-
-
-"analytical"
-→ User wants computations, aggregations, rankings, comparisons,
-distributions, trends, correlations, or statistical summaries.
-
+"statistical"
+→ User wants aggregations, rankings, comparisons across groups, or
+  statistical analysis computed from the data.
+→ Use when the request requires GROUP BY, ORDER BY aggregation, or stats.
 Examples:
-- "average value by category"
-- "top 10 entities by total count"
-- "compare regions"
-- "distribution of response times"
-- "find outliers"
-- "correlation between variables"
-- "median value per group"
-- "rank products by revenue"
-
-Use whenever the request requires grouping, aggregation,
-or analysis across multiple records.
-
+  "average order amount per category"
+  "rank products by total quantity sold descending"
+  "top 5 customers by total spend"
+  "which product has the highest total revenue"
+  "standard deviation of prices"
+  "correlation between age and order amount"
+  "distribution of order amounts"
+  "compare onshore vs offshore headcount"
+  "which city has the most orders"
+  "total revenue by product"
 
 "reasoning"
-→ User wants interpretation, explanation, business insights,
-summaries, recommendations, or narrative conclusions.
-
+→ User wants a business explanation, summary, or narrative insight.
 Examples:
-- "why is performance declining"
-- "summarize the trends"
-- "what does this data tell us"
-- "explain the anomalies"
-- "what are the key takeaways"
-- "suggest improvements"
-
-Use when the user wants understanding or conclusions rather than
-raw calculations.
-
-Summary of route labels:
-1. visualization  → explicit charts or plots
-2. lookup         → retrieve existing records
-3. metadata       → understand schema or possible values
-4. analysis       → aggregate, compare, rank, compute statistics
-5. reasoning      → explain, summarize, infer, recommend
+  "why is revenue dropping"
+  "summarize the sales trend"
+  "what does this data tell us"
+  "explain the pattern"
+  "what are the key takeaways"
 
 CRITICAL ROUTING RULES — DO NOT FAIL THESE:
 
 1. "list all unique X", "what are the distinct X", "most common X", "top N frequent X"
-   → ALWAYS "metadata". These explore data values, not compute metrics.
-2. "rank by", "top N by total", "average X per Y", "which has the most/least"
+   → ALWAYS "metadata". These explore existing data values, not compute new metrics.
+2. "rank by", "top N by total", "average X per Y", "which has the most/least total"
    → ALWAYS "statistical". These compute aggregated analytical results.
-3. "show me a chart / plot / graph"
+3. "show me a chart / plot / bar chart / pie chart"
    → ALWAYS "visualization", regardless of aggregation involved.
-4. "which customer placed the most orders", "show orders above 500"
-   → "sql_answer". Simple lookups or filters on specific records.
+4. "show orders above 500", "list customers from London", "find order by id"
+   → ALWAYS "sql_answer". Direct record lookups or row filters.
 5. "what columns", "show schema", "data types", "describe table"
-   → "metadata". Pure structure questions.
-6. Output ONLY the JSON object. No markdown, no backticks, no explanation outside JSON.
+   → ALWAYS "metadata". Pure structure questions.
+6. NEVER output route labels like "analytical", "lookup", or "record_lookup" —
+   they are NOT valid. Use only the five labels listed above.
+7. Output ONLY the JSON object. No markdown, no backticks, no text outside JSON.
 """
 
 # ══════════════════════════════════════════════

@@ -32,14 +32,35 @@ _METADATA_PATTERNS = [
     r"\bschema\b", r"\bdescribe\s+the\s+table\b", r"\btable\s+structure\b",
     r"\bhow\s+many\s+columns\b", r"\bwhat\s+tables\b", r"\bfield\s+names\b",
     r"\bstructure\s+of\s+(the\s+)?(data|table)\b",
-    # NOTE: deliberately does NOT match "how many rows" — that's sql_answer,
-    # per the existing system prompt's own rule.
+    # Unique / distinct value listing → Route C
+    r"\blist\s+(all\s+)?(unique|distinct)\b",
+    r"\bwhat\s+are\s+the\s+(unique|distinct|possible|available)\b",
+    r"\bunique\s+values?\s+(in|of|for)\b",
+    r"\bdistinct\s+values?\s+(in|of|for)\b",
+    r"\bshow\s+(all\s+)?(unique|distinct)\b",
+    r"\bpossible\s+values?\b", r"\bavailable\s+values?\b",
+    r"\bhow\s+many\s+unique\b", r"\bhow\s+many\s+distinct\b",
+    # Top frequent / most common → Route C
+    r"\bmost\s+common\b", r"\bleast\s+common\b",
+    r"\bmost\s+frequent\b", r"\bleast\s+frequent\b",
 ]
 
 _STATISTICAL_PATTERNS = [
+    # Classic stats
     r"\boutliers?\b", r"\banomal(y|ies)\b", r"\bpercentile\b",
     r"\bz[\s-]?score\b", r"\bstandard\s+deviation\b", r"\bcorrelation\b",
     r"\bvariance\b", r"\bmedian\b", r"\bquartile\b", r"\bskew(ness)?\b",
+    r"\bstddev\b",
+    # Ranking / top-N analytical
+    r"\brank\s+(the|all|by|products?|customers?|orders?|employees?)\b",
+    r"\branked\s+by\b", r"\branking\s+by\b",
+    r"\btop\s+\d+\s+(customers?|products?|orders?|employees?|cities|categories)\b",
+    r"\bbottom\s+\d+\b",
+    # Aggregated comparisons across groups
+    r"\btotal\s+spend\b", r"\btotal\s+revenue\b", r"\btotal\s+sales\b",
+    r"\bdistribution\s+of\b", r"\bbreakdown\s+of\b",
+    r"\bcompare\s+.{0,30}\bacross\b",
+    r"\bwhich\s+.{0,30}\bhas\s+the\s+(most|least|highest|lowest)\b",
 ]
 
 _REASONING_PATTERNS = [
@@ -108,7 +129,7 @@ def classify(prompt: str, known_columns: set[str] | None = None) -> dict:
             matches[route] = hits
 
     if _has_grouped_aggregation(prompt, known_columns):
-        matches.setdefault("visualization", []).append("aggregation_by_per")
+        matches.setdefault("statistical", []).append("aggregation_by_per")
 
     candidates = list(matches.keys())
 
@@ -122,14 +143,12 @@ def classify(prompt: str, known_columns: set[str] | None = None) -> dict:
         }
 
     if not candidates:
-        # No signal at all -> default to the safe, generic fallback route
-        # rather than spending an LLM call on it. This is a deliberate
-        # speed/safety tradeoff: worst case is a table instead of a chart,
-        # never a wrong or hallucinated answer.
+        # No pattern matched — send to LLM to decide rather than silently
+        # defaulting to sql_answer, which swallows Route C and D queries.
         return {
-            "route":      "sql_answer",
-            "confidence": "MEDIUM",
-            "ambiguous":  False,
+            "route":      None,
+            "confidence": "LOW",
+            "ambiguous":  True,
             "candidates": [],
             "matches":    matches,
         }
