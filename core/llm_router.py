@@ -100,13 +100,19 @@ Examples:
   "show a histogram of ages"
 
 "sql_answer"
-→ User wants specific records, rows, or simple direct lookups.
+→ User wants specific records, rows, or simple direct lookups from the data.
 → Use when the answer is a direct retrieval — NOT a ranking or group comparison.
+→ IMPORTANT: Asking for names, values, or attributes of entities IS a data
+  retrieval — it is NOT metadata. "Names of customers" means fetch rows,
+  not inspect the schema.
 Examples:
+  "what are the names of customers and their age"
   "show all orders above 500"
   "list customers from New York"
   "what is the email of customer 101"
   "show all completed sessions"
+  "give me all product names and prices"
+  "who are the customers in London"
 
 "metadata"
 → User wants to explore the dataset structure, schema, columns, data types,
@@ -156,8 +162,9 @@ CRITICAL ROUTING RULES — DO NOT FAIL THESE:
    → ALWAYS "statistical". These compute aggregated analytical results.
 3. "show me a chart / plot / bar chart / pie chart"
    → ALWAYS "visualization", regardless of aggregation involved.
-4. "show orders above 500", "list customers from London", "find order by id"
-   → ALWAYS "sql_answer". Direct record lookups or row filters.
+4. "show orders above 500", "list customers from London", "find order by id",
+   "what are the names of X", "give me X and their Y", "who are the X"
+   → ALWAYS "sql_answer". These fetch data rows — NOT metadata about schema.
 5. "what columns", "show schema", "data types", "describe table"
    → ALWAYS "metadata". Pure structure questions.
 6. NEVER output route labels like "analytical", "lookup", or "record_lookup" —
