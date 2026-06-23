@@ -578,25 +578,48 @@ def _validate_sql(conn, sql: str, table: str, tables: list[str], intent: dict) -
             except Exception:
                 pass
 
+        # Aggregation aliases the LLM may return as y_axis/x_axis —
+        # these are computed by the SQL itself, not real table columns,
+        # so Layer 1 must not reject them. Layer 2 (EXPLAIN) catches
+        # any real SQL errors involving these names.
+        _COMPUTED_ALIASES = {
+            "count", "total", "average", "avg", "sum", "min", "max",
+            "frequency", "percent", "pct", "ratio", "rate", "rank",
+            "median", "stddev", "variance", "revenue", "spend",
+        }
+
         for axis in ("x_axis", "y_axis", "group_by", "order_by"):
             col = intent.get(axis)
             if not col:
                 continue
-            # Defense in depth: if a wrapped expression like "average(quantity)"
-            # ever reaches here, validate the real underlying column instead.
-            col, _ = _unwrap_agg_column(col)
-            col_l = col.lower()
+            # Unwrap wrapped expressions like "average(quantity)" → "quantity"
+            unwrapped, _ = _unwrap_agg_column(col)
+            col_l = unwrapped.lower().strip()
+
+            # Skip validation if it is a known computed alias — it does not
+            # exist as a table column; it is produced by the SQL aggregation.
+            if col_l in _COMPUTED_ALIASES:
+                log.append(f"Layer 1 SKIP: '{col}' is a computed alias, not a table column")
+                continue
+
+            # Skip validation if the intent also specifies an aggregation —
+            # the LLM returned the alias name rather than the source column.
+            if intent.get("aggregation") and intent.get("aggregation") != "none":
+                if axis == "y_axis":
+                    log.append(f"Layer 1 SKIP: '{col}' is y_axis with aggregation '{intent['aggregation']}' — alias, not a table column")
+                    continue
+
             if col_l in target_cols:
                 continue
             if col_l in other_cols:
                 msg = (
-                    f"Layer 1 WARN: column '{col}' not in target table '{table}' "
+                    f"Layer 1 WARN: column '{unwrapped}' not in target table '{table}' "
                     f"but found in another loaded table — SQL must JOIN to use it"
                 )
                 log.append(msg)
                 print(f"   {_YELLOW}{msg}{_R}", flush=True)
                 continue
-            msg = f"Layer 1 FAIL: column '{col}' not found in '{table}' or any other loaded table"
+            msg = f"Layer 1 FAIL: column '{unwrapped}' not found in '{table}' or any other loaded table"
             log.append(msg)
             print(f"   {_RED}{msg}{_R}\n{_BOLD}{_BLUE}└──{_R}", flush=True)
             return False, log
