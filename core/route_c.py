@@ -102,9 +102,7 @@ def _guess_target_column(prompt: str, summaries: list[dict]) -> tuple[str | None
     """
     Best-effort: find the table + column the user is asking about.
     Used for keyword-matching queries like 'list unique categories'.
-    Returns (table_name, column_name) or (None, None) if no match found.
-    Never falls back to a guessed column — returns (None, None) to let the
-    caller surface a clear error to the user.
+    Returns (table_name, column_name) or (None, None).
     """
     words = set(re.findall(r"[a-zA-Z_][a-zA-Z0-9_]*", prompt.lower()))
 
@@ -121,7 +119,19 @@ def _guess_target_column(prompt: str, summaries: list[dict]) -> tuple[str | None
             if any(w in col_l or col_l in w for w in words if len(w) > 3):
                 return s["table"], col
 
-    # No match found — do not fall back to a guessed column
+    # 3. Fall back to the first categorical column of the first table
+    for s in summaries:
+        non_numeric = [
+            col for col, dtype in s["dtypes"].items()
+            if not any(t in dtype.lower() for t in ["int", "float", "double", "decimal", "numeric", "real"])
+        ]
+        if non_numeric:
+            return s["table"], non_numeric[0]
+
+    # 4. Absolute fallback — first column of first table
+    if summaries:
+        return summaries[0]["table"], summaries[0]["columns"][0]
+
     return None, None
 
 
@@ -319,21 +329,6 @@ def run(conn, tables: list[str], prompt: str) -> RouteCResult:
 
     # ── 4–7. Keyword-matching queries ─────────────────────────────────────────
     table, col = _guess_target_column(prompt, summaries)
-    if table is None or col is None:
-        all_cols = ", ".join(
-            f"`{c}` ({s['table']})"
-            for s in summaries
-            for c in s["columns"]
-        )
-        return RouteCResult(
-            success=False,
-            error=(
-                "I couldn't identify which column your question refers to. "
-                f"Please mention a column name explicitly. "
-                f"Available columns: {all_cols}."
-            ),
-        )
-
     if table and col:
 
         # 4. Unique / distinct values listing

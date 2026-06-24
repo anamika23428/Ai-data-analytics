@@ -291,10 +291,7 @@ def _extract_intent(ddl: str, tables: list[str], question: str, conn=None) -> di
         "histogram", "heatmap", "box", "funnel", "treemap",
     )
     if intent["chart_type"] not in _VALID_CHART_TYPES:
-        raise ValueError(
-            f"Intent extraction returned an unrecognised chart type: "
-            f"'{intent['chart_type']}'. Valid types: {', '.join(_VALID_CHART_TYPES)}."
-        )
+        intent["chart_type"] = "bar"
     if intent["aggregation"] not in ("sum", "avg", "count", "min", "max", "none"):
         intent["aggregation"] = "none"
 
@@ -323,10 +320,8 @@ def _extract_intent(ddl: str, tables: list[str], question: str, conn=None) -> di
     if chosen_table.lower() in table_lookup:
         intent["table"] = table_lookup[chosen_table.lower()]
     else:
-        raise ValueError(
-            f"Intent extraction picked an unknown table: '{chosen_table}'. "
-            f"Available tables: {', '.join(tables)}."
-        )
+        # Model didn't pick a valid table — default to the first one
+        intent["table"] = tables[0] if tables else chosen_table
 
     print(
         f"   table={_CYAN}{intent['table']}{_R}  "
@@ -752,11 +747,7 @@ def _build_chart(df: pd.DataFrame, intent: dict) -> go.Figure:
                 )
                 fig.update_layout(xaxis_tickangle=-35)
             else:
-                raise ValueError(
-                    f"Bar chart requires both x_axis and y_axis columns, "
-                    f"but got x='{intent.get('x_axis')}' y='{intent.get('y_axis')}'. "
-                    f"Available columns: {list(df.columns)}."
-                )
+                fig = _fallback_bar(df, title)
 
         elif chart_type in ("pie", "donut"):
             names_col  = x_col or (df.columns[0] if len(df.columns) >= 1 else None)
@@ -767,11 +758,7 @@ def _build_chart(df: pd.DataFrame, intent: dict) -> go.Figure:
                     hole=0.45 if chart_type == "donut" else 0.0,
                 )
             else:
-                raise ValueError(
-                    f"{chart_type.capitalize()} chart requires names and values columns, "
-                    f"but got x='{intent.get('x_axis')}' y='{intent.get('y_axis')}'. "
-                    f"Available columns: {list(df.columns)}."
-                )
+                fig = _fallback_bar(df, title)
 
         elif chart_type in ("line", "area"):
             if x_col and y_col:
@@ -789,11 +776,7 @@ def _build_chart(df: pd.DataFrame, intent: dict) -> go.Figure:
                     markers=True if chart_type == "line" else False,
                 )
             else:
-                raise ValueError(
-                    f"{chart_type.capitalize()} chart requires both x_axis and y_axis columns, "
-                    f"but got x='{intent.get('x_axis')}' y='{intent.get('y_axis')}'. "
-                    f"Available columns: {list(df.columns)}."
-                )
+                fig = _fallback_bar(df, title)
 
         elif chart_type == "scatter":
             if x_col and y_col:
@@ -805,20 +788,10 @@ def _build_chart(df: pd.DataFrame, intent: dict) -> go.Figure:
                     trendline="ols" if group_col is None else None,
                 )
             else:
-                raise ValueError(
-                    f"Scatter chart requires both x_axis and y_axis columns, "
-                    f"but got x='{intent.get('x_axis')}' y='{intent.get('y_axis')}'. "
-                    f"Available columns: {list(df.columns)}."
-                )
+                fig = _fallback_bar(df, title)
 
         elif chart_type == "histogram":
-            col = x_col or y_col
-            if not col:
-                raise ValueError(
-                    f"Histogram requires at least an x_axis column, "
-                    f"but got x='{intent.get('x_axis')}' y='{intent.get('y_axis')}'. "
-                    f"Available columns: {list(df.columns)}."
-                )
+            col = x_col or y_col or df.select_dtypes(include="number").columns[0]
             fig = px.histogram(
                 df, x=col,
                 color=group_col,
@@ -837,9 +810,7 @@ def _build_chart(df: pd.DataFrame, intent: dict) -> go.Figure:
                     zmin=-1, zmax=1,
                 )
             else:
-                raise ValueError(
-                    "Heatmap requires numeric columns, but none were found in the query result."
-                )
+                fig = _fallback_bar(df, title)
 
         elif chart_type == "box":
             if y_col:
@@ -850,11 +821,7 @@ def _build_chart(df: pd.DataFrame, intent: dict) -> go.Figure:
                     labels={y_col: y_label, **({x_col: x_label} if x_col else {})},
                 )
             else:
-                raise ValueError(
-                    f"Box plot requires a y_axis column, "
-                    f"but got y='{intent.get('y_axis')}'. "
-                    f"Available columns: {list(df.columns)}."
-                )
+                fig = _fallback_bar(df, title)
 
         elif chart_type == "funnel":
             names_col  = x_col or (df.columns[0] if len(df.columns) >= 1 else None)
@@ -862,11 +829,7 @@ def _build_chart(df: pd.DataFrame, intent: dict) -> go.Figure:
             if names_col and values_col:
                 fig = px.funnel(df, x=values_col, y=names_col, title=title)
             else:
-                raise ValueError(
-                    f"Funnel chart requires names and values columns, "
-                    f"but got x='{intent.get('x_axis')}' y='{intent.get('y_axis')}'. "
-                    f"Available columns: {list(df.columns)}."
-                )
+                fig = _fallback_bar(df, title)
 
         elif chart_type == "treemap":
             path_col   = x_col or (df.columns[0] if len(df.columns) >= 1 else None)
@@ -876,21 +839,14 @@ def _build_chart(df: pd.DataFrame, intent: dict) -> go.Figure:
                     df, path=[path_col], values=values_col, title=title,
                 )
             else:
-                raise ValueError(
-                    f"Treemap requires path and values columns, "
-                    f"but got x='{intent.get('x_axis')}' y='{intent.get('y_axis')}'. "
-                    f"Available columns: {list(df.columns)}."
-                )
+                fig = _fallback_bar(df, title)
 
         else:
-            raise ValueError(
-                f"Unsupported chart type: '{chart_type}'. "
-                f"Valid types: bar, pie, donut, line, area, scatter, histogram, heatmap, box, funnel, treemap."
-            )
+            fig = _fallback_bar(df, title)
 
     except Exception as e:
-        logger.error("Chart build failed: %s", e)
-        raise RuntimeError(f"Visualization failed: {e}") from e
+        logger.warning("Chart build failed (%s), using fallback bar chart", e)
+        fig = _fallback_bar(df, title)
 
     # Consistent layout polish
     fig.update_layout(
@@ -982,19 +938,9 @@ def run(
         _print_fail(result.error)
         return result
 
-    # Resolve the chosen table — error if LLM returned an invalid name
+    # Resolve the chosen table (falls back to first table if LLM returned invalid name)
     table_lookup = {t.lower(): t for t in tables}
-    chosen = str(intent.get("table") or "").strip()
-    if not chosen or chosen.lower() not in table_lookup:
-        result.error = (
-            f"Could not determine which table to query "
-            f"(intent returned '{chosen}'). "
-            f"Available tables: {', '.join(tables)}."
-        )
-        result.stage_reached = "intent"
-        _print_fail(result.error)
-        return result
-    target_table = table_lookup[chosen.lower()]
+    target_table = table_lookup.get(str(intent.get("table") or "").lower(), primary_table)
     intent["table"] = target_table
 
     # ── Stage 2: SQL Generation ───────────────────────────────────────────────
