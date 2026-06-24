@@ -5,7 +5,7 @@
 #      so the model sees exact column names — eliminates hallucinated names.
 #   2. num_predict raised 512 → 1024 so long queries are never truncated.
 #   3. Self-repair pass: on DuckDB EXPLAIN failure, sends the error back to
-#      qwen2.5-coder and asks it to fix the query (one retry, fully local).
+#      qwen2.5-coder and asks it to fix the query (up to 3 attempts).
 #   4. Removed the hardcoded Amazon 'category|pipe' hint — that was dataset-
 #      specific and confused the model on every other dataset.
 #   5. _harden_casts: bare CAST(...) is auto-upgraded to TRY_CAST(...) so a
@@ -21,6 +21,10 @@
 #      VARCHAR columns (e.g. a pipe-joined "category" hierarchy) directly in
 #      the column dictionary, so the model knows to UNNEST(STRING_SPLIT(...))
 #      instead of treating the whole joined string as one literal value.
+#  10. _fix_unnest_in_where: deterministically rewrites the model's common
+#      mistake of list_contains(UNNEST(STRING_SPLIT(...))) in WHERE clauses,
+#      which DuckDB rejects. Enforced in code since self-repair consistently
+#      fails to break this habit across all 3 repair attempts.
 
 import logging
 import re
@@ -31,14 +35,14 @@ from config import OLLAMA_BASE_URL, SQL_MODEL, OLLAMA_TIMEOUT
 logger = logging.getLogger(__name__)
 
 # ── ANSI colours ──────────────────────────────────────────────────────────────
-_R    = "\033[0m"
-_BOLD = "\033[1m"
-_BLUE = "\033[94m"
+_R     = "\033[0m"
+_BOLD  = "\033[1m"
+_BLUE  = "\033[94m"
 _GREEN = "\033[92m"
 _YELLOW = "\033[93m"
-_RED  = "\033[91m"
-_DIM  = "\033[2m"
-_CYAN = "\033[96m"
+_RED   = "\033[91m"
+_DIM   = "\033[2m"
+_CYAN  = "\033[96m"
 
 # ── System prompt ──────────────────────────────────────────────────────────────
 _SYSTEM_PROMPT = """\
@@ -58,7 +62,7 @@ COLUMN RULES — THIS IS CRITICAL:
 
 MULTI-TABLE & "ENTIRE FILE" QUERIES:
 1. If the user asks about the whole file or all data, use UNION ALL.
-2. CRITICAL FILTER: You MUST read the COLUMN DICTIONARY before adding a table to the UNION. 
+2. CRITICAL FILTER: You MUST read the COLUMN DICTIONARY before adding a table to the UNION.
 3. If a table DOES NOT have the relevant column, YOU MUST SKIP THAT TABLE ENTIRELY.
 4. NEVER write `SELECT name FROM table` unless the exact word "name" is in the dictionary.
 
@@ -72,12 +76,32 @@ DUCKDB STRING CONVERSION RULES (CRITICAL):
 - Never include the '%' symbol in mathematical comparisons in the WHERE/HAVING clause (e.g., use > 50 instead of > 50%).
 - ALWAYS clean and TRY_CAST string columns to DOUBLE *before* doing math, filtering in WHERE/HAVING clauses, or sorting in ORDER BY. Never compare a text column directly to a string number (e.g., `rating_count > '1,000'` is WRONG. It must be `TRY_CAST(...) > 1000`).
 
+DELIMITED COLUMN RULES (CRITICAL — READ CAREFULLY):
+If the COLUMN DICTIONARY marks a column as [DELIMITED with 'X'], it stores
+multiple segments joined by 'X' in a single string.
+
+There are EXACTLY TWO ways to use a delimited column. Choose based on context:
+
+1. To LIST or GROUP segments (SELECT DISTINCT, GROUP BY):
+   Use UNNEST(STRING_SPLIT(col, 'X')) in the SELECT or FROM clause.
+   CORRECT:
+     SELECT DISTINCT UNNEST(STRING_SPLIT(category, '|')) AS cat FROM t;
+     SELECT UNNEST(STRING_SPLIT(category, '|')) AS cat, COUNT(*) FROM t GROUP BY cat;
+
+2. To FILTER rows that contain a segment (WHERE clause):
+   Use list_contains(STRING_SPLIT(col, 'X'), 'value') — NO UNNEST.
+   CORRECT:   WHERE list_contains(STRING_SPLIT(category, '|'), 'Electronics')
+   WRONG:     WHERE list_contains(UNNEST(STRING_SPLIT(category, '|')), 'Electronics')
+   WRONG:     WHERE category = 'Electronics'
+   WRONG:     WHERE category LIKE '%Electronics%'
+
+NEVER use UNNEST inside a WHERE clause. DuckDB does not support it there.
+
 DUCKDB-SPECIFIC RULES:
 - When using SUM/AVG/COUNT/MIN/MAX, always include the matching GROUP BY clause.
-- If the COLUMN DICTIONARY marks a column as [DELIMITED with 'X'], you MUST ALWAYS expand it using UNNEST(STRING_SPLIT(col, 'X')) before doing SELECT DISTINCT, COUNT, GROUP BY, or filtering. Never select or group the raw joined string.
-- Column aliases defined in SELECT can be used in ORDER BY, but NOT in WHERE or HAVING.
 - If you use math operators (<, >, =) on a text/VARCHAR column, you MUST ALWAYS wrap the column in TRY_CAST(... AS DOUBLE) first. Never compare a string directly to an integer.
 - If you use aggregation functions like SUM() or AVG(), you MUST wrap the column in TRY_CAST(... AS DOUBLE). Never attempt to SUM() or AVG() a raw VARCHAR.
+- Column aliases defined in SELECT can be used in ORDER BY, but NOT in WHERE or HAVING.
 - LIMIT always goes after ORDER BY.
 """
 
@@ -99,24 +123,34 @@ The SQL query you wrote caused this DuckDB error:
 Here is the broken query:
 {sql}
 
+REPAIR INSTRUCTIONS:
+- If the error says "UNNEST not supported here" in a WHERE clause:
+  UNNEST cannot be used inside WHERE. Replace it with list_contains:
+  WRONG: WHERE list_contains(UNNEST(STRING_SPLIT(col, '|')), 'value')
+  RIGHT: WHERE list_contains(STRING_SPLIT(col, '|'), 'value')
+
+- If the error says "Referenced column not found" and provides "Candidate bindings":
+  Replace your hallucinated column name with one of the exact Candidate bindings
+  provided in the error message.
+
+- For all other errors: fix the specific syntax or logic error described.
+
 Write a corrected DuckDB SQL query that fixes this error exactly.
-CRITICAL: If the error says "Referenced column not found" and provides "Candidate bindings", you MUST replace your hallucinated column name with one of the exact Candidate bindings provided in the error message!
 Output ONLY the raw SQL, nothing else.
 """
 
-# ── Delimiter detection ─────────────────────────────────────────────────────
-_DELIMITER_CANDIDATES = ["|", ";", "/", ">"]
-_DELIMITER_MIN_RATIO = 0.5
+# ── Delimiter detection ────────────────────────────────────────────────────────
+_DELIMITER_CANDIDATES  = ["|", ";", "/", ">"]
+_DELIMITER_MIN_RATIO   = 0.5
 _DELIMITER_SAMPLE_LIMIT = 200
 
 
 def _detect_delimiter(conn, table_name: str, col: str) -> str | None:
     """
     Check whether a VARCHAR column's values are internally delimited
-    (e.g. "Computers&Accessories|Cables|USBCables"). Without this, the
-    model has no way to know a column needs UNNEST(STRING_SPLIT(...))
-    instead of a direct equality/IN/DISTINCT match, and will silently
-    generate SQL that treats the full joined string as one value.
+    (e.g. "Computers&Accessories|Cables|USBCables"). Without this hint,
+    the model treats the whole joined string as one literal value and
+    generates SQL that silently returns 0 rows.
     """
     escaped = f'"{col}"'
     try:
@@ -142,9 +176,8 @@ def _build_column_dict(conn, table_names: list[str]) -> str:
     """
     Query DuckDB DESCRIBE for each table and build an explicit column
     dictionary. VARCHAR/TEXT columns are additionally checked for internal
-    delimiters (e.g. a pipe-joined category hierarchy) and flagged inline
-    so the model knows to UNNEST(STRING_SPLIT(...)) rather than treat the
-    full joined string as one literal value.
+    delimiters and flagged inline so the model knows to use
+    UNNEST(STRING_SPLIT(...)) or list_contains(STRING_SPLIT(...)) correctly.
     """
     lines = []
     for table in table_names:
@@ -158,9 +191,10 @@ def _build_column_dict(conn, table_names: list[str]) -> str:
                     delim = _detect_delimiter(conn, table, col_name)
                     if delim:
                         entry += (
-                            f" [DELIMITED with '{delim}' — ALWAYS expand using "
-                            f"UNNEST(STRING_SPLIT(\"{col_name}\", '{delim}')) before "
-                            f"doing SELECT DISTINCT, GROUP BY, or filtering]"
+                            f" [DELIMITED with '{delim}' — use "
+                            f"UNNEST(STRING_SPLIT(\"{col_name}\", '{delim}')) in SELECT/GROUP BY "
+                            f"or list_contains(STRING_SPLIT(\"{col_name}\", '{delim}'), 'value') "
+                            f"in WHERE — NEVER use = or IN on this column directly]"
                         )
                 col_parts.append(entry)
             lines.append(f'Table "{table}": [ {", ".join(col_parts)} ]')
@@ -176,6 +210,7 @@ def _strip_fences(text: str) -> str:
 
 
 def _extract_sql(raw: str) -> str | None:
+    """Pull the first SELECT/WITH block out of the model response."""
     raw = _strip_fences(raw)
     m = re.search(r"(SELECT|WITH)\b[\s\S]*", raw, flags=re.I)
     if not m:
@@ -189,6 +224,7 @@ def _extract_sql(raw: str) -> str | None:
 
 
 def _harden_casts(sql: str) -> str:
+    """Upgrade bare CAST(...) → TRY_CAST(...) so one bad value never crashes a query."""
     return re.sub(r"\bCAST\s*\(", "TRY_CAST(", sql, flags=re.IGNORECASE)
 
 
@@ -212,6 +248,7 @@ def _find_matching_paren(s: str, open_idx: int) -> int | None:
         i += 1
     return None
 
+
 def _split_top_level_args(s: str) -> list[str]:
     args = []
     depth = 0
@@ -227,7 +264,7 @@ def _split_top_level_args(s: str) -> list[str]:
             depth += 1
         elif ch == ")" and not in_single and not in_double:
             depth -= 1
-            
+
         if ch == "," and depth == 0 and not in_single and not in_double:
             args.append("".join(current))
             current = []
@@ -236,42 +273,83 @@ def _split_top_level_args(s: str) -> list[str]:
     args.append("".join(current))
     return args
 
+
 _REPLACE_CALL_START = re.compile(r"\bREPLACE\s*\(", re.IGNORECASE)
 
+
 def _fix_decimal_stripping(sql: str) -> str:
+    """
+    Remove any REPLACE(<expr>, '.', '') the model generates.
+    Stripping '.' from a decimal number silently corrupts values:
+    "4.5" → "45", producing wildly wrong aggregates.
+    Uses paren-matching instead of regex to avoid cross-expression corruption.
+    """
     result = sql
     while True:
         changed = False
         for match in _REPLACE_CALL_START.finditer(result):
-            open_idx = match.end() - 1
+            open_idx  = match.end() - 1
             close_idx = _find_matching_paren(result, open_idx)
             if close_idx is None:
                 continue
-                
+
             inner = result[open_idx + 1: close_idx]
-            args = _split_top_level_args(inner)
-            
+            args  = _split_top_level_args(inner)
+
             if len(args) != 3:
                 continue
-                
-            search_arg = args[1].strip()
+
+            search_arg  = args[1].strip()
             replace_arg = args[2].strip()
-            
+
             if search_arg in ("'.'", '"."') and replace_arg in ("''", '""'):
-                expr = args[0].strip()
+                expr   = args[0].strip()
                 result = result[:match.start()] + expr + result[close_idx + 1:]
                 changed = True
-                break  
-                
+                break  # string indices shifted — restart scan
+
         if not changed:
             break
-            
+
     return result
 
 
+_UNNEST_IN_LIST_CONTAINS = re.compile(
+    r"list_contains\(\s*UNNEST\(\s*STRING_SPLIT\(\s*([^,]+?)\s*,\s*('[^']*'|\"[^\"]*\")\s*\)\s*\)\s*,",
+    re.IGNORECASE,
+)
+
+
+def _fix_unnest_in_where(sql: str) -> str:
+    """
+    Rewrite list_contains(UNNEST(STRING_SPLIT(col, 'X')), ...)
+          → list_contains(STRING_SPLIT(col, 'X'), ...)
+
+    DuckDB does not support UNNEST inside a WHERE clause or inside
+    list_contains(). The model generates this pattern frequently because
+    it confuses the SELECT-clause UNNEST usage (valid) with the WHERE-clause
+    usage (invalid). Three rounds of self-repair consistently fail to break
+    this habit, so it is enforced deterministically here instead.
+    """
+    before = sql
+    sql = _UNNEST_IN_LIST_CONTAINS.sub(
+        r"list_contains(STRING_SPLIT(\1, \2),",
+        sql,
+    )
+    if sql != before:
+        logger.info("Fixed UNNEST-in-list_contains pattern in WHERE clause.")
+    return sql
+
+
 def _harden_sql(sql: str) -> str:
+    """
+    Apply all deterministic post-generation safety rewrites.
+    Logs a before/after when any rewrite actually fires so it's visible
+    whether the model needed correction or wrote correct SQL on its own.
+    """
     before = sql
     sql = _fix_decimal_stripping(sql)
+    sql = _fix_unnest_in_where(sql)
     sql = _harden_casts(sql)
     if sql != before:
         print(f"   {_YELLOW}⚙️ SQL Hardened (Regex safety nets applied){_R}", flush=True)
@@ -284,13 +362,13 @@ def _harden_sql(sql: str) -> str:
 
 def _call_ollama(messages: list[dict], max_tokens: int = 1024) -> str:
     payload = {
-        "model":    SQL_MODEL,
+        "model":   SQL_MODEL,
         "messages": messages,
-        "stream":   False,
-        "options":  {
+        "stream":  False,
+        "options": {
             "temperature": 0.0,
             "num_predict": max_tokens,
-            "num_ctx": 8192,
+            "num_ctx":     8192,
         },
     }
     resp = requests.post(
@@ -300,11 +378,10 @@ def _call_ollama(messages: list[dict], max_tokens: int = 1024) -> str:
     )
 
     if resp.status_code != 200:
-        error_details = resp.text
         raise Exception(
             f"Ollama returned HTTP {resp.status_code}. "
             f"Model requested: '{SQL_MODEL}'. "
-            f"Ollama's exact error message: {error_details}"
+            f"Ollama's exact error message: {resp.text}"
         )
 
     return resp.json()["message"]["content"].strip()
@@ -316,11 +393,18 @@ def _print_fail(msg: str) -> None:
 
 def generate_safe_sql(
     prompt: str,
-    ddl_schema: str,      
-    table_name: str,      
-    db_session=None,      
+    ddl_schema: str,       # kept for backward-compatibility; used only when conn is None
+    table_name: str,       # comma-separated table names
+    db_session=None,       # DuckDB connection — used to build live column dict
 ) -> dict:
-    conn = db_session
+    """
+    Generate a valid DuckDB SELECT query for *prompt*.
+
+    Returns:
+        {"success": True,  "sql": "<query>"}
+        {"success": False, "error": "<message>"}
+    """
+    conn       = db_session
     all_tables = [t.strip() for t in table_name.split(",") if t.strip()] if table_name else []
 
     print(
@@ -331,16 +415,13 @@ def generate_safe_sql(
         flush=True,
     )
 
+    # ── Build column dictionary ───────────────────────────────────────────────
     if conn and all_tables:
         column_dict = _build_column_dict(conn, all_tables)
     else:
         column_dict = f"(DDL schema — use column names from this only):\n{ddl_schema}"
 
-    user_payload = _USER_TEMPLATE.format(
-        column_dict=column_dict,
-        prompt=prompt,
-    )
-
+    user_payload = _USER_TEMPLATE.format(column_dict=column_dict, prompt=prompt)
     messages = [
         {"role": "system", "content": _SYSTEM_PROMPT},
         {"role": "user",   "content": user_payload},
@@ -352,10 +433,14 @@ def generate_safe_sql(
         flush=True,
     )
 
+    # ── First attempt ─────────────────────────────────────────────────────────
     try:
         raw = _call_ollama(messages)
     except requests.exceptions.ConnectionError:
-        msg = f"Cannot connect to Ollama at {OLLAMA_BASE_URL}. Make sure Ollama is running: `ollama serve`"
+        msg = (
+            f"Cannot connect to Ollama at {OLLAMA_BASE_URL}. "
+            "Make sure Ollama is running: `ollama serve`"
+        )
         logger.error(msg)
         _print_fail(msg)
         return {"success": False, "error": msg}
@@ -375,75 +460,95 @@ def generate_safe_sql(
 
     sql = _harden_sql(sql)
     logger.info("SQL first attempt (%d chars): %s…", len(sql), sql[:100])
-    
     print(f"   sql={_DIM}{sql[:120]}…{_R}\n{_BOLD}{_BLUE}└──{_R}", flush=True)
 
-    # ── Self-repair pass ───────────────────────────────────────────────────────
-# ── Self-repair pass (Upgraded to 3 Attempts) ──────────────────────────────
+    # ── Self-repair loop (up to 3 attempts via EXPLAIN) ───────────────────────
     if conn:
         print(
             f"\n{_BOLD}{_BLUE}┌── Route B · Stage 2: Validation & Repair{_R}",
             flush=True,
         )
-        
-        max_repairs = 3
-        # Create a working copy of messages to track conversation history across retries
-        repair_messages = list(messages)
+
+        max_repairs    = 3
+        repair_messages = list(messages)   # maintain full conversation history across retries
 
         for attempt in range(1, max_repairs + 1):
             try:
-                # Try to execute EXPLAIN on the current SQL
                 conn.execute(f"EXPLAIN {sql}")
-                
-                # If it succeeds, log success and break out of the loop
+                # EXPLAIN passed — SQL is syntactically valid
                 if attempt == 1:
                     logger.info("SQL passed EXPLAIN on first attempt.")
-                    print(f"   {_GREEN}EXPLAIN PASS{_R}: SQL is valid\n{_BOLD}{_BLUE}└──{_R}", flush=True)
+                    print(
+                        f"   {_GREEN}EXPLAIN PASS{_R}: SQL is valid\n"
+                        f"{_BOLD}{_BLUE}└──{_R}",
+                        flush=True,
+                    )
                 else:
-                    logger.info("Self-repair succeeded: %s…", sql[:100])
-                    print(f"   {_GREEN}Self-repair succeeded (Attempt {attempt}/{max_repairs}){_R}\n{_BOLD}{_BLUE}└──{_R}", flush=True)
+                    logger.info("Self-repair succeeded (attempt %d): %s…", attempt, sql[:100])
+                    print(
+                        f"   {_GREEN}Self-repair succeeded (Attempt {attempt}/{max_repairs}){_R}\n"
+                        f"{_BOLD}{_BLUE}└──{_R}",
+                        flush=True,
+                    )
                 break
-                
+
             except Exception as explain_err:
-                # If it's the final attempt, we stop trying and exit the loop
                 if attempt == max_repairs:
-                    logger.warning("Self-repair also failed EXPLAIN (%s)", explain_err)
-                    print(f"   {_RED}Self-repair failed after {max_repairs} attempts — passing original to validator{_R}\n{_BOLD}{_BLUE}└──{_R}", flush=True)
+                    logger.warning(
+                        "Self-repair exhausted after %d attempts (%s) — "
+                        "passing to validator.", max_repairs, explain_err
+                    )
+                    print(
+                        f"   {_RED}Self-repair failed after {max_repairs} attempts — "
+                        f"passing original to validator{_R}\n{_BOLD}{_BLUE}└──{_R}",
+                        flush=True,
+                    )
                     break
-                
-                # Log the failure and state that we are attempting a repair
+
                 if attempt == 1:
                     logger.warning("SQL failed EXPLAIN (%s) — attempting self-repair…", explain_err)
-                    print(f"   {_YELLOW}EXPLAIN FAIL ({explain_err}) — attempting self-repair (Attempt 1/{max_repairs})…{_R}", flush=True)
+                    print(
+                        f"   {_YELLOW}EXPLAIN FAIL ({explain_err}) — "
+                        f"attempting self-repair (Attempt 1/{max_repairs})…{_R}",
+                        flush=True,
+                    )
                 else:
-                    logger.warning("Self-repair failed EXPLAIN (%s) — attempting self-repair %d/%d…", explain_err, attempt, max_repairs)
-                    print(f"   {_YELLOW}Self-repair failed ({explain_err}) — attempting self-repair (Attempt {attempt}/{max_repairs})…{_R}", flush=True)
+                    logger.warning(
+                        "Self-repair failed EXPLAIN (%s) — attempt %d/%d…",
+                        explain_err, attempt, max_repairs,
+                    )
+                    print(
+                        f"   {_YELLOW}Self-repair failed ({explain_err}) — "
+                        f"attempting self-repair (Attempt {attempt}/{max_repairs})…{_R}",
+                        flush=True,
+                    )
 
-                # Format the error payload
                 repair_payload = _REPAIR_TEMPLATE.format(error=str(explain_err), sql=sql)
-                
-                # Append the failed SQL and the DuckDB error to the ongoing conversation history
-                # so the model knows what it already tried
                 repair_messages.append({"role": "assistant", "content": sql})
-                repair_messages.append({"role": "user", "content": repair_payload})
-                
+                repair_messages.append({"role": "user",      "content": repair_payload})
+
                 try:
-                    # Ask Ollama for the fix
                     raw_repair = _call_ollama(repair_messages, max_tokens=1024)
-                    repaired = _extract_sql(raw_repair)
-                    
+                    repaired   = _extract_sql(raw_repair)
                     if repaired:
-                        # Harden the new SQL and loop back up to EXPLAIN it
-                        sql = _harden_sql(repaired)
+                        sql = _harden_sql(repaired)   # harden repair output too
                     else:
                         logger.warning("Self-repair produced no valid SQL.")
-                        print(f"   {_RED}Self-repair produced no valid SQL{_R}\n{_BOLD}{_BLUE}└──{_R}", flush=True)
+                        print(
+                            f"   {_RED}Self-repair produced no valid SQL{_R}\n"
+                            f"{_BOLD}{_BLUE}└──{_R}",
+                            flush=True,
+                        )
                         break
-                        
                 except Exception as repair_exc:
                     logger.warning("Self-repair Ollama call failed: %s", repair_exc)
-                    print(f"   {_RED}Self-repair Ollama call failed{_R}\n{_BOLD}{_BLUE}└──{_R}", flush=True)
+                    print(
+                        f"   {_RED}Self-repair Ollama call failed{_R}\n"
+                        f"{_BOLD}{_BLUE}└──{_R}",
+                        flush=True,
+                    )
                     break
+
     print(
         f"\n{_BOLD}{_GREEN}{'═'*55}{_R}\n"
         f"  {_GREEN}{_BOLD}ROUTE B COMPLETE ✓{_R}\n"
