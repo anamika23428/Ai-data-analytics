@@ -16,9 +16,8 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import uuid
-from streamlit_autorefresh import st_autorefresh
 
-from config import MAX_FILE_SIZE_MB, SESSION_TTL_MINUTES, TMP_BASE_DIR
+from config import MAX_FILE_SIZE_MB, SESSION_TTL_MINUTES
 from core.validator import validate_file, validate_sql_query
 from core.session_mgr import (
     create_session,
@@ -54,10 +53,6 @@ logging.basicConfig(
 
 st.set_page_config(page_title="Data Chatbot", page_icon="📊", layout="wide")
 
-# ── Auto-refresh every 30 seconds so expiry is detected even when user is idle ──
-# This silently re-runs the page in the background without disrupting the user.
-st_autorefresh(interval=30_000, key="session_watchdog")
-
 cleanup_old_sessions()
 start_cleanup_daemon()
 
@@ -71,10 +66,14 @@ if "processed_files" not in st.session_state: st.session_state.processed_files =
 if "file_table_map"  not in st.session_state: st.session_state.file_table_map  = {}
 if "chat_history"    not in st.session_state: st.session_state.chat_history    = []
 if "uploader_key"    not in st.session_state: st.session_state.uploader_key    = str(uuid.uuid4())
-if "session_expired" not in st.session_state: st.session_state.session_expired = False
 
 
-# ── Helper functions (defined before use) ────────────────────────────────────
+def _on_uploader_change():
+    current_names = {f.name for f in (st.session_state.get(st.session_state.uploader_key) or [])}
+    removed = st.session_state.processed_files - current_names
+    for fname in removed:
+        _remove_file(fname)
+
 
 def _reset_session_state():
     st.session_state.session_id      = None
@@ -95,13 +94,6 @@ def _reset_session_state():
     st.session_state.uploader_key    = str(uuid.uuid4())
 
 
-def _on_uploader_change():
-    current_names = {f.name for f in (st.session_state.get(st.session_state.uploader_key) or [])}
-    removed = st.session_state.processed_files - current_names
-    for fname in removed:
-        _remove_file(fname)
-
-
 def _remove_file(filename: str):
     tables_for_file = st.session_state.file_table_map.get(filename, [])
     delete_file_from_session(
@@ -119,40 +111,6 @@ def _remove_file(filename: str):
         st.session_state.loaded_tables = get_all_tables(st.session_state.duckdb_conn)
     else:
         st.session_state.loaded_tables = []
-
-
-# ── Session Expiry Detection ──────────────────────────────────────────────────
-# The background cleanup daemon deletes the disk folder when idle > TTL, but
-# Streamlit's in-memory session_state survives until the browser tab closes.
-# On every page render (including the auto-refresh every 30s) we check: if we
-# think we have a live session but the folder is gone, it means the daemon
-# expired it — so we reset in-memory state and rerun to clear the UI immediately.
-def _check_session_expired():
-    """Detect background-expired sessions and reset state so the UI stays consistent."""
-    if st.session_state.session_id is not None:
-        session_dir = Path(TMP_BASE_DIR) / st.session_state.session_id
-        if not session_dir.exists():
-            # Close the now-orphaned DuckDB connection gracefully
-            if st.session_state.duckdb_conn:
-                try:
-                    st.session_state.duckdb_conn.close()
-                except Exception:
-                    pass
-            _reset_session_state()
-            st.session_state.session_expired = True
-            st.rerun()  # immediately refresh UI to show cleared state
-
-
-_check_session_expired()
-
-# Show a one-time banner when a session has just been expired
-if st.session_state.session_expired:
-    st.warning(
-        f"⏰ **Your session expired after {SESSION_TTL_MINUTES} minutes of inactivity** "
-        "and your data has been deleted. Please upload your files again to continue.",
-        icon="⏰",
-    )
-    st.session_state.session_expired = False
 
 
 # ═══════════════════════════════════════════════
@@ -308,7 +266,7 @@ with st.sidebar:
         "▶  Load Files",
         type="primary",
         disabled=(not uploaded_files),
-        use_container_width=True,
+        use_container_width=True, 
     )
 
     if st.session_state.duckdb_conn and st.session_state.loaded_tables:
