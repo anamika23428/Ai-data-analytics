@@ -114,6 +114,86 @@ def _remove_file(filename: str):
 
 
 # ═══════════════════════════════════════════════
+#  LLM-powered friendly error explainer
+# ═══════════════════════════════════════════════
+
+def _explain_error_friendly(user_prompt: str, error_msg: str, sql: str | None = None) -> dict:
+    """
+    Ask the local LLM to explain a SQL/query error in plain English and
+    suggest how the user might rephrase their question.
+
+    Returns:
+        {
+          "explanation": str,   # plain-English reason the query failed
+          "suggestion":  str,   # what the user might have meant
+          "rephrasing":  str,   # concrete example of a better question
+        }
+    or falls back to a static dict on any Ollama failure.
+    """
+    from config import OLLAMA_BASE_URL, INTENT_MODEL, OLLAMA_TIMEOUT
+    import requests as _requests
+
+    sql_context = f"\n\nGenerated SQL:\n{sql}" if sql else ""
+
+    system_prompt = """\
+You are a helpful data assistant. A user asked a question about their data,
+but the system could not generate a valid database query to answer it.
+
+Your job is to:
+1. Explain in ONE plain-English sentence why the question could not be answered
+   (e.g. column not found, ambiguous question, no matching data).
+2. Suggest what the user might have actually meant (one short sentence).
+3. Provide ONE concrete rephrased question the user could try instead.
+
+Respond ONLY with a JSON object — no markdown, no backticks, no extra text:
+{
+  "explanation": "<one sentence: why it failed>",
+  "suggestion":  "<one sentence: what you think they meant>",
+  "rephrasing":  "<one example of a better question>"
+}"""
+
+    user_content = (
+        f"User question: {user_prompt}\n"
+        f"Error: {error_msg}"
+        f"{sql_context}"
+    )
+
+    try:
+        resp = _requests.post(
+            f"{OLLAMA_BASE_URL}/api/chat",
+            json={
+                "model":   INTENT_MODEL,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user",   "content": user_content},
+                ],
+                "stream":  False,
+                "options": {"temperature": 0.3, "num_predict": 256},
+            },
+            timeout=OLLAMA_TIMEOUT,
+        )
+        if resp.status_code == 200:
+            raw = resp.json()["message"]["content"].strip()
+            # strip ```json fences if model adds them
+            raw = re.sub(r"```json\s*", "", raw, flags=re.I)
+            raw = re.sub(r"```", "", raw).strip()
+            import json as _json
+            parsed = _json.loads(raw)
+            # validate expected keys exist
+            if all(k in parsed for k in ("explanation", "suggestion", "rephrasing")):
+                return parsed
+    except Exception:
+        pass  # fall through to static fallback
+
+    # ── Static fallback ──────────────────────────────────────────────────────
+    return {
+        "explanation": "I wasn't able to generate a valid query for your question.",
+        "suggestion":  "You may be referring to a column or topic that isn't in the data.",
+        "rephrasing":  "Could you rephrase your question using column names shown in the schema?",
+    }
+
+
+# ═══════════════════════════════════════════════
 #  Chat Message Renderer
 # ═══════════════════════════════════════════════
 def _render_assistant_message(msg: dict):
@@ -139,12 +219,26 @@ def _render_assistant_message(msg: dict):
         st.warning(msg["warning"])
 
     if msg.get("error"):
-        st.error(msg["error"])
-        if msg.get("sql"):
-            with st.expander("🔎 Generated SQL (failed)"):
-                st.code(msg["sql"], language="sql")
-        if msg.get("val_log"):
-            with st.expander("🔍 Validation log"):
+        # ── Friendly LLM-powered error response ──────────────────────────────
+        user_q   = msg.get("user_prompt", "your question")
+        err_raw  = msg["error"]
+        sql_ctx  = msg.get("sql")
+
+        with st.spinner("Let me figure out what went wrong…"):
+            friendly = _explain_error_friendly(user_q, err_raw, sql_ctx)
+
+        st.warning(
+            f"**I couldn't answer that question.**\n\n"
+            f"🔍 **What happened:** {friendly['explanation']}\n\n"
+            f"💡 **Are you referring to:** {friendly['suggestion']}\n\n"
+            f"✏️ **Please rephrase your question — for example:**\n> {friendly['rephrasing']}"
+        )
+
+        with st.expander("🛠️ Technical details", expanded=False):
+            st.caption(f"**Error:** {err_raw}")
+            if sql_ctx:
+                st.code(sql_ctx, language="sql")
+            if msg.get("val_log"):
                 for line in msg["val_log"]:
                     st.text(line)
         return
@@ -398,6 +492,7 @@ else:
                         "confidence":    confidence,
                         "stage":         route_stage,
                         "router_parsed": parsed_route,
+                        "user_prompt":   prompt,        # stored so error explainer can reference the original question
                     }
 
                     if not routing_result.get("success"):
