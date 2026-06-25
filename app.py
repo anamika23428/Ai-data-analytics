@@ -472,7 +472,6 @@ else:
             with st.chat_message("assistant"):
                 with st.spinner("Analyzing..."):
 
-                    # Build DDL for the router (schema only, no row data)
                     ddl_for_router = (
                         generate_multi_table_ddl(
                             conn, tables, redact=False, max_columns=DDL_MAX_COLUMNS
@@ -501,37 +500,25 @@ else:
                         "confidence":    confidence,
                         "stage":         route_stage,
                         "router_parsed": parsed_route,
-                        "user_prompt":   prompt,        # stored so error explainer can reference the original question
+                        "user_prompt":   prompt,
                     }
 
                     if not routing_result.get("success"):
                         assistant_msg["error"] = (
                             f"Query routing failed: {routing_result.get('error')}"
                         )
-                        _stamp_friendly_error(assistant_msg)
-                        _render_assistant_message(assistant_msg)
-                        st.session_state.chat_history.append(assistant_msg)
-                        st.rerun()
 
-                    if not route_label:
+                    elif not route_label:
                         assistant_msg["error"] = (
                             "The system could not determine how to handle your question. "
                             "Please try rephrasing it."
                         )
-                        _stamp_friendly_error(assistant_msg)
-                        _render_assistant_message(assistant_msg)
-                        st.session_state.chat_history.append(assistant_msg)
-                        st.rerun()
 
-                    # ── Route: reasoning → handled by Route D ──────────────
-                    if route_label == "reasoning":
-                        with st.spinner("Analyzing..."):
-                            route_d_result = run_route_d(
-                                conn=conn,
-                                tables=tables,
-                                prompt=prompt,
-                                route_label=route_label,
-                            )
+                    elif route_label == "reasoning":
+                        route_d_result = run_route_d(
+                            conn=conn, tables=tables, prompt=prompt,
+                            route_label=route_label,
+                        )
                         if not route_d_result.success:
                             assistant_msg["error"] = route_d_result.error or "Route D failed."
                             assistant_msg["sql"]   = route_d_result.sql
@@ -541,10 +528,7 @@ else:
                                 "sql":    route_d_result.sql,
                                 "df":     route_d_result.dataframe,
                             })
-                        _stamp_friendly_error(assistant_msg)
-                        _render_assistant_message(assistant_msg)
 
-                    # ── Route: metadata ───────────────────────────────────────
                     elif route_label == "metadata":
                         route_c_result = run_route_c(
                             conn=conn, tables=tables, prompt=prompt
@@ -557,15 +541,10 @@ else:
                                 assistant_msg["tables"] = route_c_result.tables
                             if route_c_result.dataframe is not None:
                                 assistant_msg["df"] = route_c_result.dataframe
-                        _stamp_friendly_error(assistant_msg)
-                        _render_assistant_message(assistant_msg)
 
-                    # ── Route: visualization ──────────────────────────────────
                     elif route_label == "visualization":
                         route_a_result = run_route_a(
-                            conn=conn,
-                            tables=tables,
-                            prompt=prompt,
+                            conn=conn, tables=tables, prompt=prompt,
                             router_intent=parsed_route,
                         )
                         if not route_a_result.success:
@@ -583,18 +562,12 @@ else:
                                 "df":      route_a_result.df,
                                 "fig":     route_a_result.fig,
                             })
-                        _stamp_friendly_error(assistant_msg)
-                        _render_assistant_message(assistant_msg)
 
-                    # ── Route: statistical ───────────────────────────────────
                     elif route_label == "statistical":
-                        with st.spinner("Running statistical analysis..."):
-                            route_d_result = run_route_d(
-                                conn=conn,
-                                tables=tables,
-                                prompt=prompt,
-                                route_label=route_label,
-                            )
+                        route_d_result = run_route_d(
+                            conn=conn, tables=tables, prompt=prompt,
+                            route_label=route_label,
+                        )
                         if not route_d_result.success:
                             assistant_msg["error"] = route_d_result.error or "Route D failed."
                             assistant_msg["sql"]   = route_d_result.sql
@@ -604,11 +577,8 @@ else:
                                 "sql":    route_d_result.sql,
                                 "df":     route_d_result.dataframe,
                             })
-                        _stamp_friendly_error(assistant_msg)
-                        _render_assistant_message(assistant_msg)
 
-                    # ── Route: sql_answer ─────────────────────────────────────
-                    else:
+                    else:  # sql_answer
                         sql_result = generate_safe_sql(
                             prompt=prompt,
                             ddl_schema=ddl_for_router,
@@ -634,6 +604,11 @@ else:
                                     assistant_msg["error"] = f"Execution error: {e}"
                                     assistant_msg["sql"]   = sql
 
-                        _stamp_friendly_error(assistant_msg)
-                        _render_assistant_message(assistant_msg)
+                    # Compute friendly error once while spinner is still showing
+                    _stamp_friendly_error(assistant_msg)
+
+                # Spinner is now closed — render is visible to the user
+                _render_assistant_message(assistant_msg)
+
+            st.session_state.chat_history.append(assistant_msg)
             st.rerun()
