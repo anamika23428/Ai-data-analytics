@@ -119,19 +119,6 @@ def _guess_target_column(prompt: str, summaries: list[dict]) -> tuple[str | None
             if any(w in col_l or col_l in w for w in words if len(w) > 3):
                 return s["table"], col
 
-    # 3. Fall back to the first categorical column of the first table
-    for s in summaries:
-        non_numeric = [
-            col for col, dtype in s["dtypes"].items()
-            if not any(t in dtype.lower() for t in ["int", "float", "double", "decimal", "numeric", "real"])
-        ]
-        if non_numeric:
-            return s["table"], non_numeric[0]
-
-    # 4. Absolute fallback — first column of first table
-    if summaries:
-        return summaries[0]["table"], summaries[0]["columns"][0]
-
     return None, None
 
 
@@ -367,8 +354,15 @@ def run(conn, tables: list[str], prompt: str) -> RouteCResult:
         ]):
             return _handle_value_existence(conn, table, col, prompt)
 
-    # ── 8. Default: table overview ────────────────────────────────────────────
-    lines = ["Loaded table overview:"]
+    # ── No match found ────────────────────────────────────────────────────────
+    col_names = []
     for s in summaries:
-        lines.append(f"- **{s['table']}**: {s['row_count']:,} rows, {s['column_count']} columns")
-    return RouteCResult(success=True, answer="\n".join(lines))
+        col_names.extend(f"`{c}`" for c in s["columns"])
+    return RouteCResult(
+        success=False,
+        error=(
+            "I couldn't identify which column or topic your question refers to. "
+            f"The loaded data has these columns: {', '.join(col_names)}. "
+            "Please rephrase your question using one of those column names."
+        ),
+    )

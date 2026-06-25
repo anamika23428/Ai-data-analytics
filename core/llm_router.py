@@ -383,19 +383,20 @@ def route_query(
         raw_text     = raw_response["message"]["content"]
         parsed       = _parse_json_safe(raw_text)
 
-        parsed["confidence"] = str(parsed.get("confidence", "MEDIUM")).upper()
+        parsed["confidence"] = str(parsed.get("confidence", "")).upper()
         if parsed["confidence"] not in ("HIGH", "MEDIUM", "LOW"):
-            parsed["confidence"] = "MEDIUM"
+            raise ValueError(
+                f"Router returned an unrecognised confidence level: '{parsed.get('confidence')}'. "
+                "Expected HIGH, MEDIUM, or LOW."
+            )
 
         # Validate route label — reject hallucinated labels
         valid_routes = {"visualization", "sql_answer", "metadata", "statistical"}
         if parsed.get("route") not in valid_routes:
-            logger.warning(
-                "LLM returned invalid route '%s' — falling back to sql_answer",
-                parsed.get("route"),
+            raise ValueError(
+                f"Router returned an unrecognised route: '{parsed.get('route')}'. "
+                f"Valid routes are: {', '.join(sorted(valid_routes))}."
             )
-            parsed["route"]      = "sql_answer"
-            parsed["confidence"] = "LOW"
 
         result = {
             "success":      True,

@@ -183,13 +183,13 @@ Respond ONLY with a JSON object — no markdown, no backticks, no extra text:
             if all(k in parsed for k in ("explanation", "suggestion", "rephrasing")):
                 return parsed
     except Exception:
-        pass  # fall through to static fallback
+        pass  # fall through to generic message
 
-    # ── Static fallback ──────────────────────────────────────────────────────
+    # ── Generic message when LLM is unavailable ──────────────────────────────
     return {
         "explanation": "I wasn't able to generate a valid query for your question.",
-        "suggestion":  "You may be referring to a column or topic that isn't in the data.",
-        "rephrasing":  "Could you rephrase your question using column names shown in the schema?",
+        "suggestion":  "Your question may reference a column or value not present in the loaded data.",
+        "rephrasing":  "Try rephrasing using the exact column names shown in the schema panel.",
     }
 
 
@@ -480,7 +480,7 @@ else:
                     )
 
                     parsed_route = routing_result.get("parsed") or {}
-                    route_label  = parsed_route.get("route", "sql_answer")
+                    route_label  = parsed_route.get("route")
                     confidence   = parsed_route.get("confidence", "HIGH")
                     route_stage  = routing_result.get("stage", "?")
 
@@ -496,13 +496,21 @@ else:
                     }
 
                     if not routing_result.get("success"):
-                        assistant_msg["warning"] = (
-                            f"Router fallback — Error: {routing_result.get('error')}"
+                        assistant_msg["error"] = (
+                            f"Query routing failed: {routing_result.get('error')}"
                         )
-                    elif confidence == "LOW":
-                        assistant_msg["warning"] = (
-                            "⚠️ The query router is unsure. Proceeding as sql_answer."
+                        _render_assistant_message(assistant_msg)
+                        st.session_state.chat_history.append(assistant_msg)
+                        st.rerun()
+
+                    if not route_label:
+                        assistant_msg["error"] = (
+                            "The system could not determine how to handle your question. "
+                            "Please try rephrasing it."
                         )
+                        _render_assistant_message(assistant_msg)
+                        st.session_state.chat_history.append(assistant_msg)
+                        st.rerun()
 
                     # ── Route: reasoning → handled by Route D ──────────────
                     if route_label == "reasoning":

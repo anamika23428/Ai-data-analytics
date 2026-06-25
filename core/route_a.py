@@ -284,14 +284,18 @@ def _extract_intent(ddl: str, tables: list[str], question: str, conn=None) -> di
     intent = json.loads(raw)
 
     # Normalise chart_type and aggregation
-    intent["chart_type"]  = str(intent.get("chart_type",  "bar")).lower()
+    intent["chart_type"]  = str(intent.get("chart_type",  "")).lower()
     intent["aggregation"] = str(intent.get("aggregation", "none")).lower()
     _VALID_CHART_TYPES = (
         "bar", "pie", "donut", "line", "area", "scatter",
         "histogram", "heatmap", "box", "funnel", "treemap",
     )
     if intent["chart_type"] not in _VALID_CHART_TYPES:
-        intent["chart_type"] = "bar"
+        raise ValueError(
+            f"The AI could not determine a valid chart type for your question "
+            f"(got '{intent['chart_type']}'). Please specify the chart type explicitly, "
+            f"e.g. 'show a bar chart of ...' or 'pie chart of ...'."
+        )
     if intent["aggregation"] not in ("sum", "avg", "count", "min", "max", "none"):
         intent["aggregation"] = "none"
 
@@ -320,8 +324,11 @@ def _extract_intent(ddl: str, tables: list[str], question: str, conn=None) -> di
     if chosen_table.lower() in table_lookup:
         intent["table"] = table_lookup[chosen_table.lower()]
     else:
-        # Model didn't pick a valid table — default to the first one
-        intent["table"] = tables[0] if tables else chosen_table
+        raise ValueError(
+            f"The AI selected a table '{chosen_table}' that does not exist in your loaded data. "
+            f"Available tables: {', '.join(tables)}. "
+            "Please rephrase your question or check that the right file is loaded."
+        )
 
     print(
         f"   table={_CYAN}{intent['table']}{_R}  "
@@ -747,7 +754,11 @@ def _build_chart(df: pd.DataFrame, intent: dict) -> go.Figure:
                 )
                 fig.update_layout(xaxis_tickangle=-35)
             else:
-                fig = _fallback_bar(df, title)
+                raise ValueError(
+                    f"A bar chart needs both an X axis and a Y axis, but the query result "
+                    f"did not provide {'an X column' if not x_col else 'a Y column'}. "
+                    "Please rephrase your question to specify what you want on each axis."
+                )
 
         elif chart_type in ("pie", "donut"):
             names_col  = x_col or (df.columns[0] if len(df.columns) >= 1 else None)
@@ -758,7 +769,11 @@ def _build_chart(df: pd.DataFrame, intent: dict) -> go.Figure:
                     hole=0.45 if chart_type == "donut" else 0.0,
                 )
             else:
-                fig = _fallback_bar(df, title)
+                raise ValueError(
+                    "A pie/donut chart needs at least two columns (category and value), "
+                    "but the query result did not return enough columns. "
+                    "Please rephrase your question to include a category and a numeric value."
+                )
 
         elif chart_type in ("line", "area"):
             if x_col and y_col:
@@ -776,7 +791,11 @@ def _build_chart(df: pd.DataFrame, intent: dict) -> go.Figure:
                     markers=True if chart_type == "line" else False,
                 )
             else:
-                fig = _fallback_bar(df, title)
+                raise ValueError(
+                    f"A {chart_type} chart needs both an X axis and a Y axis, but the query result "
+                    f"did not provide {'an X column' if not x_col else 'a Y column'}. "
+                    "Please rephrase your question to specify what you want on each axis."
+                )
 
         elif chart_type == "scatter":
             if x_col and y_col:
@@ -788,10 +807,18 @@ def _build_chart(df: pd.DataFrame, intent: dict) -> go.Figure:
                     trendline="ols" if group_col is None else None,
                 )
             else:
-                fig = _fallback_bar(df, title)
+                raise ValueError(
+                    "A scatter plot needs both an X axis and a Y axis column. "
+                    "Please rephrase your question, e.g. 'scatter plot of price vs rating'."
+                )
 
         elif chart_type == "histogram":
-            col = x_col or y_col or df.select_dtypes(include="number").columns[0]
+            col = x_col or y_col or (df.select_dtypes(include="number").columns[0] if not df.select_dtypes(include="number").empty else None)
+            if col is None:
+                raise ValueError(
+                    "A histogram needs a numeric column, but no numeric columns were found in the result. "
+                    "Please rephrase your question to target a numeric field."
+                )
             fig = px.histogram(
                 df, x=col,
                 color=group_col,
@@ -810,7 +837,10 @@ def _build_chart(df: pd.DataFrame, intent: dict) -> go.Figure:
                     zmin=-1, zmax=1,
                 )
             else:
-                fig = _fallback_bar(df, title)
+                raise ValueError(
+                    "A heatmap requires numeric columns, but no numeric data was found in the query result. "
+                    "Please rephrase your question to include numeric fields."
+                )
 
         elif chart_type == "box":
             if y_col:
@@ -821,7 +851,10 @@ def _build_chart(df: pd.DataFrame, intent: dict) -> go.Figure:
                     labels={y_col: y_label, **({x_col: x_label} if x_col else {})},
                 )
             else:
-                fig = _fallback_bar(df, title)
+                raise ValueError(
+                    "A box plot needs a Y axis (numeric) column. "
+                    "Please rephrase your question, e.g. 'box plot of price by category'."
+                )
 
         elif chart_type == "funnel":
             names_col  = x_col or (df.columns[0] if len(df.columns) >= 1 else None)
@@ -829,7 +862,10 @@ def _build_chart(df: pd.DataFrame, intent: dict) -> go.Figure:
             if names_col and values_col:
                 fig = px.funnel(df, x=values_col, y=names_col, title=title)
             else:
-                fig = _fallback_bar(df, title)
+                raise ValueError(
+                    "A funnel chart needs at least two columns (stage name and value). "
+                    "Please rephrase your question to include a category and a numeric value."
+                )
 
         elif chart_type == "treemap":
             path_col   = x_col or (df.columns[0] if len(df.columns) >= 1 else None)
@@ -839,14 +875,20 @@ def _build_chart(df: pd.DataFrame, intent: dict) -> go.Figure:
                     df, path=[path_col], values=values_col, title=title,
                 )
             else:
-                fig = _fallback_bar(df, title)
+                raise ValueError(
+                    "A treemap needs at least two columns (category path and value). "
+                    "Please rephrase your question to include a category and a numeric value."
+                )
 
         else:
-            fig = _fallback_bar(df, title)
+            raise ValueError(
+                f"'{chart_type}' is not a supported chart type. "
+                "Supported types: bar, pie, donut, line, area, scatter, histogram, heatmap, box, funnel, treemap."
+            )
 
     except Exception as e:
-        logger.warning("Chart build failed (%s), using fallback bar chart", e)
-        fig = _fallback_bar(df, title)
+        logger.warning("Chart build failed (%s)", e)
+        raise
 
     # Consistent layout polish
     fig.update_layout(

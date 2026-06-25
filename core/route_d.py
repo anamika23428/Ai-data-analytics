@@ -311,8 +311,14 @@ def run(
     try:
         observation = _generate_observation(prompt, sql, df)
     except Exception as exc:
-        logger.warning("Route D observation failed (non-fatal): %s", exc)
-        observation = f"Query returned {len(df):,} row(s)."
+        logger.error("Route D observation failed: %s", exc)
+        return RouteDResult(
+            success=False,
+            route=route_label,
+            error=f"The query ran successfully but the AI observation step failed: {exc}",
+            dataframe=df,
+            sql=sql,
+        )
 
     return RouteDResult(
         success=True,
