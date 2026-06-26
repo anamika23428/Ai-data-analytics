@@ -25,28 +25,29 @@
 #      mistake of list_contains(UNNEST(STRING_SPLIT(...))) in WHERE clauses,
 #      which DuckDB rejects. Enforced in code since self-repair consistently
 #      fails to break this habit across all 3 repair attempts.
-#  11. _humanize_error: converts raw technical error strings (DuckDB errors,
-#      Ollama errors, internal errors) into plain-English user-facing messages
-#      before returning them. Raw technical detail is still logged for
-#      debugging; only the human-readable version surfaces in the UI.
+#  11. _humanize_error: converts raw technical error strings into plain-English
+#      user-facing messages using llama3.2:3b (already warm from the routing
+#      step). Falls back to a cleaned raw message if the LLM call fails.
+#      Ollama connectivity errors are handled without an LLM call since you
+#      cannot call Ollama to explain that Ollama is unreachable.
 
 import logging
 import re
 import requests
 
-from config import OLLAMA_BASE_URL, SQL_MODEL, OLLAMA_TIMEOUT
+from config import OLLAMA_BASE_URL, SQL_MODEL, OLLAMA_TIMEOUT, ROUTER_MODEL
 
 logger = logging.getLogger(__name__)
 
 # ── ANSI colours ──────────────────────────────────────────────────────────────
-_R     = "\033[0m"
-_BOLD  = "\033[1m"
-_BLUE  = "\033[94m"
-_GREEN = "\033[92m"
+_R      = "\033[0m"
+_BOLD   = "\033[1m"
+_BLUE   = "\033[94m"
+_GREEN  = "\033[92m"
 _YELLOW = "\033[93m"
-_RED   = "\033[91m"
-_DIM   = "\033[2m"
-_CYAN  = "\033[96m"
+_RED    = "\033[91m"
+_DIM    = "\033[2m"
+_CYAN   = "\033[96m"
 
 # ── System prompt ──────────────────────────────────────────────────────────────
 _SYSTEM_PROMPT = """\
@@ -143,133 +144,131 @@ Write a corrected DuckDB SQL query that fixes this error exactly.
 Output ONLY the raw SQL, nothing else.
 """
 
-# ── Natural-language error translation ────────────────────────────────────────
-# Maps technical error patterns to plain-English messages shown to the user.
-# Raw technical detail is still logged separately for debugging.
-# Order matters — more specific patterns should come before generic ones.
-_ERROR_TRANSLATIONS: list[tuple[str, str]] = [
-    # Ollama connectivity
-    (
-        r"Cannot connect to Ollama|Connection refused|ConnectionError",
-        "The AI model server isn't running. Please start Ollama with "
-        "`ollama serve` and try again.",
-    ),
-    (
-        r"took longer than \d+s|Timeout|timed out",
-        "The AI model took too long to respond — it may still be loading "
-        "into memory on first use. Please try again in a moment, or raise "
-        "OLLAMA_TIMEOUT in config.py if this happens consistently.",
-    ),
-    (
-        r"Ollama returned HTTP 404|model.*not found|try pulling",
-        "The AI model couldn't be found in Ollama. "
-        "Run `ollama list` to see what's available, then update SQL_MODEL "
-        "in config.py to match one of those names.",
-    ),
-    (
-        r"Ollama returned HTTP 500",
-        "The AI model server encountered an internal error. This usually means "
-        "the model ran out of memory. Try closing other applications and "
-        "restarting Ollama.",
-    ),
-    (
-        r"Ollama returned HTTP",
-        "The AI model server returned an unexpected error. "
-        "Check the terminal where Ollama is running for details.",
-    ),
-    # SQL generation failures
-    (
-        r"Model response contained no valid SQL",
-        "The AI didn't produce a valid query for your question. "
-        "Try rephrasing it more specifically — for example, mention "
-        "the exact column names or values you're interested in.",
-    ),
-    (
-        r"Ollama call failed",
-        "The AI model failed to respond. Please check that Ollama is "
-        "running and try again.",
-    ),
-    # DuckDB validation errors
-    (
-        r"Referenced column.*not found|column.*does not exist",
-        "The AI referenced a column that doesn't exist in your data. "
-        "Try rephrasing your question using the exact column names shown "
-        "in the schema (use the metadata route to see column names).",
-    ),
-    (
-        r"UNNEST not supported here",
-        "The AI generated a query with an unsupported pattern for a "
-        "multi-value column. This has been automatically fixed — please "
-        "try your question again.",
-    ),
-    (
-        r"Binder Error",
-        "The AI generated a query that references something that doesn't "
-        "exist in your data. Try rephrasing your question more specifically.",
-    ),
-    (
-        r"Parser Error|syntax error",
-        "The AI generated a query with a syntax error that couldn't be "
-        "automatically repaired after 3 attempts. Try rephrasing your "
-        "question more specifically.",
-    ),
-    (
-        r"Conversion Error|could not convert",
-        "The query ran into values in your data that couldn't be converted "
-        "to the expected type (e.g. text where a number was expected). "
-        "Try filtering to cleaner rows or rephrasing your question.",
-    ),
-    (
-        r"contains a disallowed keyword",
-        "The AI generated a query that was blocked by the safety validator. "
-        "Try rephrasing your question.",
-    ),
-    (
-        r"Only SELECT and WITH queries are allowed",
-        "The AI attempted to modify your data instead of just reading it. "
-        "This has been blocked. Please rephrase your question as a "
-        "read-only data question.",
-    ),
-    (
-        r"references unknown table",
-        "The AI referenced a table that isn't loaded in your session. "
-        "Check the sidebar to confirm which files are loaded, then try again.",
-    ),
-    (
-        r"could not be parsed or validated by DuckDB",
-        "The query couldn't be validated — it may contain a syntax error "
-        "or reference something that doesn't exist. Try rephrasing your question.",
-    ),
-]
+# ── LLM-based error humanization ──────────────────────────────────────────────
+# Uses llama3.2:3b (ROUTER_MODEL) — a general-purpose chat model that is
+# already warm in memory from the routing step, making it ideal for this task.
+# qwen2.5-coder is deliberately NOT used here since it is a code-specialized
+# model optimized for SQL output, not plain-English explanation.
+
+_ERROR_HUMANIZER_SYSTEM = """\
+You are a helpful data assistant that explains technical errors to non-technical users.
+
+You will be given:
+1. A technical error message from a data analytics system
+2. The user's original question
+3. Context about what the system was trying to do when the error occurred
+
+Your job is to write a single clear, friendly explanation (maximum 2 sentences) that:
+- Explains what went wrong in plain English that anyone can understand
+- Tells the user one specific thing they can try to fix it
+- NEVER mentions SQL, DuckDB, Ollama, Python, regex, HTTP, or any technical system names
+- NEVER says "the AI" — say "the system" instead
+- NEVER repeats or paraphrases the raw error message
+- NEVER uses bullet points, lists, or markdown formatting
+- NEVER adds a preamble like "Sure!" or "Of course!" — go straight to the explanation
+
+Output ONLY the plain-English explanation. Nothing else.
+"""
+
+_ERROR_HUMANIZER_USER = """\
+User's original question: {prompt}
+
+What the system was doing when the error occurred: {context}
+
+Technical error message: {error}
+
+Plain-English explanation for the user:
+"""
 
 
-def _humanize_error(technical_msg: str) -> str:
+def _humanize_error(
+    technical_msg: str,
+    prompt: str = "",
+    context: str = "generating a query for your data",
+) -> str:
     """
     Convert a raw technical error string into a plain-English user-facing
-    message. Logs the original technical message at DEBUG level so it's
-    still available for debugging without cluttering the UI.
+    message using llama3.2:3b (ROUTER_MODEL).
 
-    Falls through to the original message if no pattern matches, which is
-    better than a generic "something went wrong" for unexpected error types.
+    llama3.2:3b is chosen because:
+    - It is already loaded in memory from the routing step (no cold-start cost)
+    - It is a general-purpose chat model suited for natural-language explanation
+    - It is fast at 3B parameters, even with a short num_predict budget
+
+    Falls back gracefully (without another LLM call) when:
+    - Ollama itself is unreachable (circular — can't call Ollama to explain
+      that Ollama is down, so a hardcoded message is used instead)
+    - The humanization LLM call fails or times out for any reason
+    - The LLM returns an empty response
+
+    Raw technical detail is always logged at DEBUG level for terminal debugging
+    so developers can still see the original error without it cluttering the UI.
     """
-    if not technical_msg:
-        return "An unexpected error occurred. Please try again."
-
     logger.debug("Raw technical error (before humanization): %s", technical_msg)
 
-    for pattern, human_msg in _ERROR_TRANSLATIONS:
-        if re.search(pattern, technical_msg, re.IGNORECASE):
-            return human_msg
+    # ── Special case: Ollama connectivity errors ───────────────────────────────
+    # If Ollama is unreachable we cannot call it to explain itself — handle
+    # this with a hardcoded message rather than attempting another LLM call.
+    if re.search(
+        r"Cannot connect|Connection refused|ConnectionError|Failed to establish",
+        technical_msg,
+        re.IGNORECASE,
+    ):
+        return (
+            "The system couldn't reach the local AI model server. "
+            "Please make sure Ollama is running (`ollama serve`) and try again."
+        )
 
-    # No pattern matched — return the original so at least it's honest,
-    # but strip internal Python exception class names from the front.
-    cleaned = re.sub(r"^[\w]+Error:\s*", "", technical_msg).strip()
-    return cleaned or technical_msg
+    # ── LLM-based humanization ────────────────────────────────────────────────
+    try:
+        user_payload = _ERROR_HUMANIZER_USER.format(
+            prompt=prompt or "not specified",
+            context=context,
+            error=technical_msg,
+        )
+        payload = {
+            "model":    ROUTER_MODEL,   # llama3.2:3b — warm, chat-optimized
+            "messages": [
+                {"role": "system", "content": _ERROR_HUMANIZER_SYSTEM},
+                {"role": "user",   "content": user_payload},
+            ],
+            "stream":  False,
+            "options": {
+                "temperature": 0.1,   # slight warmth so it sounds natural
+                "num_predict": 80,    # error messages should be short
+                "num_ctx":     512,   # small context is sufficient
+            },
+        }
+        resp = requests.post(
+            f"{OLLAMA_BASE_URL}/api/chat",
+            json=payload,
+            timeout=15,   # short timeout — this is a fallback path, don't block long
+        )
+        if resp.status_code == 200:
+            explanation = resp.json()["message"]["content"].strip()
+            if explanation:
+                logger.debug("LLM humanized error: %s", explanation)
+                return explanation
+
+        logger.debug(
+            "Error humanization LLM returned status %d — falling back to raw message.",
+            resp.status_code,
+        )
+
+    except Exception as humanize_exc:
+        # Never let error humanization itself crash the app — log and fall through.
+        logger.debug("Error humanization LLM call failed: %s", humanize_exc)
+
+    # ── Fallback: clean up the raw message ────────────────────────────────────
+    # Strip Python exception class names from the front so the user doesn't
+    # see "BinderError:" or "requests.exceptions.ConnectionError:" prefixes.
+    cleaned = re.sub(r"^[\w.]+Error:\s*", "", technical_msg).strip()
+    return cleaned or "An unexpected error occurred. Please try again."
 
 
 # ── Delimiter detection ────────────────────────────────────────────────────────
-_DELIMITER_CANDIDATES  = ["|", ";", "/", ">"]
-_DELIMITER_MIN_RATIO   = 0.5
+_DELIMITER_CANDIDATES   = ["|", ";", "/", ">"]
+_DELIMITER_MIN_RATIO    = 0.5
 _DELIMITER_SAMPLE_LIMIT = 200
 
 
@@ -487,10 +486,10 @@ def _harden_sql(sql: str) -> str:
 
 def _call_ollama(messages: list[dict], max_tokens: int = 1024) -> str:
     payload = {
-        "model":   SQL_MODEL,
+        "model":    SQL_MODEL,
         "messages": messages,
-        "stream":  False,
-        "options": {
+        "stream":   False,
+        "options":  {
             "temperature": 0.0,
             "num_predict": max_tokens,
             "num_ctx":     8192,
@@ -529,9 +528,9 @@ def generate_safe_sql(
         {"success": True,  "sql": "<query>"}
         {"success": False, "error": "<plain-English user-facing message>"}
 
-    All error messages returned in the "error" key are plain English,
-    suitable for display directly in the UI. Raw technical detail is
-    logged at DEBUG/WARNING level for terminal debugging.
+    All error messages in the "error" key are plain English generated by
+    llama3.2:3b, suitable for display directly in the UI without modification.
+    Raw technical detail is logged at DEBUG/WARNING level for terminal debugging.
     """
     conn       = db_session
     all_tables = [t.strip() for t in table_name.split(",") if t.strip()] if table_name else []
@@ -569,24 +568,36 @@ def generate_safe_sql(
         technical = f"Cannot connect to Ollama at {OLLAMA_BASE_URL}: {e}"
         logger.error(technical)
         _print_fail(technical)
-        return {"success": False, "error": _humanize_error(technical)}
+        return {"success": False, "error": _humanize_error(
+            technical, prompt=prompt,
+            context="connecting to the AI model server",
+        )}
     except requests.exceptions.Timeout as e:
         technical = f"Ollama took longer than {OLLAMA_TIMEOUT}s to respond: {e}"
         logger.error(technical)
         _print_fail(technical)
-        return {"success": False, "error": _humanize_error(technical)}
+        return {"success": False, "error": _humanize_error(
+            technical, prompt=prompt,
+            context="waiting for the AI model to respond",
+        )}
     except Exception as e:
         technical = f"Ollama call failed: {e}"
         logger.error(technical)
         _print_fail(technical)
-        return {"success": False, "error": _humanize_error(technical)}
+        return {"success": False, "error": _humanize_error(
+            technical, prompt=prompt,
+            context="calling the AI model to generate a query",
+        )}
 
     sql = _extract_sql(raw)
     if not sql:
         technical = "Model response contained no valid SQL."
         logger.warning("%s Raw response (first 200 chars): %s", technical, raw[:200])
         _print_fail(technical)
-        return {"success": False, "error": _humanize_error(technical)}
+        return {"success": False, "error": _humanize_error(
+            technical, prompt=prompt,
+            context="asking the AI model to generate a SQL query for your question",
+        )}
 
     sql = _harden_sql(sql)
     logger.info("SQL first attempt (%d chars): %s…", len(sql), sql[:100])
@@ -601,7 +612,7 @@ def generate_safe_sql(
 
         max_repairs     = 3
         repair_messages = list(messages)
-        last_explain_err = None   # track the final EXPLAIN error for humanization
+        last_explain_err = None
 
         for attempt in range(1, max_repairs + 1):
             try:
@@ -629,7 +640,7 @@ def generate_safe_sql(
                 if attempt == max_repairs:
                     logger.warning(
                         "Self-repair exhausted after %d attempts (%s) — "
-                        "passing to validator.", max_repairs, explain_err
+                        "passing to validator.", max_repairs, explain_err,
                     )
                     print(
                         f"   {_RED}Self-repair failed after {max_repairs} attempts — "
