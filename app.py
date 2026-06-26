@@ -3,6 +3,10 @@ from pathlib import Path
 import socket
 
 # ── FIX: Force Python to use IPv4 so 'localhost' doesn't crash on Windows ──
+# NOTE: this patches socket.getaddrinfo process-wide for the lifetime of the
+# app — it affects every network call this process makes, not just Ollama.
+# Fine for this app's single purpose (local Ollama + Streamlit), but if a
+# future feature needs real IPv6 resolution, this patch will silently block it.
 old_getaddrinfo = socket.getaddrinfo
 def new_getaddrinfo(*args, **kwargs):
     responses = old_getaddrinfo(*args, **kwargs)
@@ -117,10 +121,21 @@ def _remove_file(filename: str):
 #  LLM-powered friendly error explainer
 # ═══════════════════════════════════════════════
 
-def _explain_error_friendly(user_prompt: str, error_msg: str, sql: str | None = None) -> dict:
+def _explain_error_friendly(
+    user_prompt: str,
+    error_msg: str,
+    sql: str | None = None,
+    column_context: str = "",
+) -> dict:
     """
     Ask the local LLM to explain a SQL/query error in plain English and
     suggest how the user might rephrase their question.
+
+    `column_context` (optional): the dataset's column dictionary (DDL/schema
+    string), passed through so the model can name a SPECIFIC data-type
+    mismatch — e.g. "you tried to sum a column of names, which holds text,
+    not numbers" — instead of a vague "column not found" or "ambiguous
+    question" explanation that doesn't actually help the user fix anything.
 
     Returns:
         {
@@ -133,21 +148,35 @@ def _explain_error_friendly(user_prompt: str, error_msg: str, sql: str | None = 
     from config import OLLAMA_BASE_URL, INTENT_MODEL, OLLAMA_TIMEOUT
     import requests as _requests
 
-    sql_context = f"\n\nGenerated SQL:\n{sql}" if sql else ""
+    sql_context    = f"\n\nGenerated SQL:\n{sql}" if sql else ""
+    column_section = f"\n\nDataset columns and types:\n{column_context}" if column_context else ""
 
     system_prompt = """\
 You are a helpful data assistant. A user asked a question about their data,
 but the system could not generate a valid database query to answer it.
 
 Your job is to:
-1. Explain in ONE plain-English sentence why the question could not be answered
-   (e.g. column not found, ambiguous question, no matching data).
+1. Explain in ONE plain-English sentence why the question could not be answered.
 2. Suggest what the user might have actually meant (one short sentence).
 3. Provide ONE concrete rephrased question the user could try instead.
 
+NAME THE SPECIFIC PROBLEM, DON'T GENERALIZE:
+- If the error or the dataset's column list shows the user tried to do MATH
+  (sum, average, total, divide, multiply) on a column that holds TEXT data
+  (names, categories, IDs, descriptions, statuses) — say so explicitly in
+  the explanation. Example: "You can't sum up employee names because that
+  column holds text, not numbers."
+- If a column name in the error doesn't exist, and a similarly-named real
+  column appears in the dataset columns list, name that real column in your
+  suggestion instead of speaking generically about "a missing column."
+- Only name a specific cause when the error message or column list actually
+  supports it — don't guess wildly if the cause isn't clear from what
+  you're given. A generic explanation is fine when no specific cause is
+  inferable, but always prefer specific over generic when you can tell.
+
 Respond ONLY with a JSON object — no markdown, no backticks, no extra text:
 {
-  "explanation": "<one sentence: why it failed>",
+  "explanation": "<one sentence: why it failed, specific if inferable>",
   "suggestion":  "<one sentence: what you think they meant>",
   "rephrasing":  "<one example of a better question>"
 }"""
@@ -156,6 +185,7 @@ Respond ONLY with a JSON object — no markdown, no backticks, no extra text:
         f"User question: {user_prompt}\n"
         f"Error: {error_msg}"
         f"{sql_context}"
+        f"{column_section}"
     )
 
     try:
@@ -193,10 +223,14 @@ Respond ONLY with a JSON object — no markdown, no backticks, no extra text:
     }
 
 
-def _stamp_friendly_error(msg: dict) -> None:
+def _stamp_friendly_error(msg: dict, ddl_schema: str = "") -> None:
     """
     Call _explain_error_friendly once at processing time and store the result
     in msg["friendly_error"] so the renderer never needs to call it again.
+
+    `ddl_schema` is forwarded as column_context so the humanizer can name a
+    specific data-type mismatch or suggest a real column name from the
+    actual dataset, instead of speaking generically.
     """
     if msg.get("error") and "friendly_error" not in msg:
         with st.spinner("Figuring out what went wrong…"):
@@ -204,8 +238,8 @@ def _stamp_friendly_error(msg: dict) -> None:
                 msg.get("user_prompt", "your question"),
                 msg["error"],
                 msg.get("sql"),
+                column_context=ddl_schema,
             )
-
 
 
 def _render_assistant_message(msg: dict):
@@ -214,7 +248,6 @@ def _render_assistant_message(msg: dict):
         "sql_answer":    "🔢",
         "metadata":      "🗂️",
         "statistical":   "📉",
-        "reasoning":     "💡",
     }
     icon        = route_icons.get(msg.get("route"), "❓")
     conf_colour = {"HIGH": "🟢", "MEDIUM": "🟡", "LOW": "🔴"}.get(msg.get("confidence"), "⚪")
@@ -274,8 +307,10 @@ def _render_assistant_message(msg: dict):
                 key=f"dl_meta_{msg['id']}",
             )
 
-    elif msg["route"] in ("statistical", "reasoning"):
+    elif msg["route"] == "statistical":
         # ── Route D: AI observation + SQL expander + result table ─────────────
+        # NOTE: Route D covers both complex-math AND narrative-reasoning
+        # questions — there is no separate "reasoning" route to branch on.
         if msg.get("answer"):
             st.markdown(f"**📊 AI Observation:** {msg['answer']}")
             st.divider()
@@ -369,7 +404,7 @@ with st.sidebar:
         "▶  Load Files",
         type="primary",
         disabled=(not uploaded_files),
-        use_container_width=True, 
+        use_container_width=True,
     )
 
     if st.session_state.duckdb_conn and st.session_state.loaded_tables:
@@ -514,20 +549,14 @@ else:
                             "Please try rephrasing it."
                         )
 
-                    elif route_label == "reasoning":
-                        route_d_result = run_route_d(
-                            conn=conn, tables=tables, prompt=prompt,
-                            route_label=route_label,
-                        )
-                        if not route_d_result.success:
-                            assistant_msg["error"] = route_d_result.error or "Route D failed."
-                            assistant_msg["sql"]   = route_d_result.sql
-                        else:
-                            assistant_msg.update({
-                                "answer": route_d_result.answer,
-                                "sql":    route_d_result.sql,
-                                "df":     route_d_result.dataframe,
-                            })
+                    # NOTE: there is no separate "reasoning" route. llm_router.py
+                    # only ever emits one of four labels: visualization,
+                    # sql_answer, metadata, statistical. Narrative/explanation
+                    # questions ("why is revenue dropping", "summarize the
+                    # trend") are folded into "statistical" and handled by the
+                    # same run_route_d() call as complex-math questions below —
+                    # so there is intentionally no elif branch for "reasoning"
+                    # here anymore; it would never be reached.
 
                     elif route_label == "metadata":
                         route_c_result = run_route_c(
@@ -586,9 +615,14 @@ else:
                             db_session=conn,
                         )
                         if not sql_result["success"]:
-                            assistant_msg["error"] = (
-                                f"LLM failed to generate valid SQL: {sql_result['error']}"
-                            )
+                            # sql_engine.py's generate_safe_sql() already returns
+                            # a humanized, user-facing message in "error" (see
+                            # _humanize_error in sql_engine.py) — passed through
+                            # as-is rather than re-wrapped with a technical
+                            # prefix, so the downstream friendly-error pass
+                            # below explains the actual problem instead of
+                            # re-explaining a sentence that's already clear.
+                            assistant_msg["error"] = sql_result["error"]
                             assistant_msg["sql"] = sql_result.get("sql")
                         else:
                             sql = sql_result["sql"]
@@ -604,8 +638,12 @@ else:
                                     assistant_msg["error"] = f"Execution error: {e}"
                                     assistant_msg["sql"]   = sql
 
-                    # Compute friendly error once while spinner is still showing
-                    _stamp_friendly_error(assistant_msg)
+                    # Compute friendly error once while spinner is still showing.
+                    # ddl_for_router is passed through as column_context so the
+                    # humanizer can name a specific data-type mismatch or a real
+                    # column name from the actual dataset, instead of speaking
+                    # generically about "a missing column" or "ambiguous question".
+                    _stamp_friendly_error(assistant_msg, ddl_schema=ddl_for_router)
 
                 # Spinner is now closed — render is visible to the user
                 _render_assistant_message(assistant_msg)
