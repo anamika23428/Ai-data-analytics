@@ -130,20 +130,6 @@ def _explain_error_friendly(
     """
     Ask the local LLM to explain a SQL/query error in plain English and
     suggest how the user might rephrase their question.
-
-    `column_context` (optional): the dataset's column dictionary (DDL/schema
-    string), passed through so the model can name a SPECIFIC data-type
-    mismatch — e.g. "you tried to sum a column of names, which holds text,
-    not numbers" — instead of a vague "column not found" or "ambiguous
-    question" explanation that doesn't actually help the user fix anything.
-
-    Returns:
-        {
-          "explanation": str,   # plain-English reason the query failed
-          "suggestion":  str,   # what the user might have meant
-          "rephrasing":  str,   # concrete example of a better question
-        }
-    or falls back to a static dict on any Ollama failure.
     """
     from config import OLLAMA_BASE_URL, INTENT_MODEL, OLLAMA_TIMEOUT
     import requests as _requests
@@ -204,18 +190,15 @@ Respond ONLY with a JSON object — no markdown, no backticks, no extra text:
         )
         if resp.status_code == 200:
             raw = resp.json()["message"]["content"].strip()
-            # strip ```json fences if model adds them
             raw = re.sub(r"```json\s*", "", raw, flags=re.I)
             raw = re.sub(r"```", "", raw).strip()
             import json as _json
             parsed = _json.loads(raw)
-            # validate expected keys exist
             if all(k in parsed for k in ("explanation", "suggestion", "rephrasing")):
                 return parsed
     except Exception:
-        pass  # fall through to generic message
+        pass  
 
-    # ── Generic message when LLM is unavailable ──────────────────────────────
     return {
         "explanation": "I wasn't able to generate a valid query for your question.",
         "suggestion":  "Your question may reference a column or value not present in the loaded data.",
@@ -224,14 +207,6 @@ Respond ONLY with a JSON object — no markdown, no backticks, no extra text:
 
 
 def _stamp_friendly_error(msg: dict, ddl_schema: str = "") -> None:
-    """
-    Call _explain_error_friendly once at processing time and store the result
-    in msg["friendly_error"] so the renderer never needs to call it again.
-
-    `ddl_schema` is forwarded as column_context so the humanizer can name a
-    specific data-type mismatch or suggest a real column name from the
-    actual dataset, instead of speaking generically.
-    """
     if msg.get("error") and "friendly_error" not in msg:
         with st.spinner("Figuring out what went wrong…"):
             msg["friendly_error"] = _explain_error_friendly(
@@ -264,7 +239,6 @@ def _render_assistant_message(msg: dict):
         st.warning(msg["warning"])
 
     if msg.get("error"):
-        # ── Friendly error response — use pre-computed result from processing ─
         err_raw  = msg["error"]
         sql_ctx  = msg.get("sql")
         friendly = msg.get("friendly_error", {})
@@ -286,7 +260,6 @@ def _render_assistant_message(msg: dict):
         return
 
     if msg["route"] == "metadata":
-        # ── Schema queries: DDL + DESCRIBE per table ──────────────────────────
         if msg.get("tables"):
             st.subheader("🗂️ Schema Information")
             for t_data in msg["tables"]:
@@ -294,7 +267,6 @@ def _render_assistant_message(msg: dict):
                     st.code(t_data["ddl"], language="sql")
                     if t_data.get("info_df") is not None:
                         st.dataframe(t_data["info_df"], width="stretch")
-        # ── Keyword-match queries: plain answer + optional result table ────────
         if msg.get("answer"):
             st.markdown(msg["answer"])
         if msg.get("df") is not None:
@@ -308,9 +280,6 @@ def _render_assistant_message(msg: dict):
             )
 
     elif msg["route"] == "statistical":
-        # ── Route D: AI observation + SQL expander + result table ─────────────
-        # NOTE: Route D covers both complex-math AND narrative-reasoning
-        # questions — there is no separate "reasoning" route to branch on.
         if msg.get("answer"):
             st.markdown(f"**📊 AI Observation:** {msg['answer']}")
             st.divider()
@@ -362,7 +331,6 @@ def _render_assistant_message(msg: dict):
             st.dataframe(msg["df"].head(50), width="stretch")
 
     else:
-        # ── Route B: sql_answer ───────────────────────────────────────────────
         if msg.get("sql"):
             st.subheader("🔎 Generated SQL")
             st.code(msg["sql"], language="sql")
@@ -549,15 +517,6 @@ else:
                             "Please try rephrasing it."
                         )
 
-                    # NOTE: there is no separate "reasoning" route. llm_router.py
-                    # only ever emits one of four labels: visualization,
-                    # sql_answer, metadata, statistical. Narrative/explanation
-                    # questions ("why is revenue dropping", "summarize the
-                    # trend") are folded into "statistical" and handled by the
-                    # same run_route_d() call as complex-math questions below —
-                    # so there is intentionally no elif branch for "reasoning"
-                    # here anymore; it would never be reached.
-
                     elif route_label == "metadata":
                         route_c_result = run_route_c(
                             conn=conn, tables=tables, prompt=prompt
@@ -577,10 +536,16 @@ else:
                             router_intent=parsed_route,
                         )
                         if not route_a_result.success:
-                            assistant_msg["error"] = (
-                                f"Visualization failed at stage "
-                                f"{route_a_result.stage_reached}: {route_a_result.error}"
-                            )
+                            # 1. Put a generic technical message for the "View Technical Details" expander
+                            assistant_msg["error"] = "Visualization pipeline failed. See terminal for stack trace."
+                            
+                            # 2. FIX: Wrap the humanized string in a dictionary so the UI renderer doesn't crash!
+                            assistant_msg["friendly_error"] = {
+                                "explanation": route_a_result.error,
+                                "suggestion": "The requested data might not be compatible with this chart.",
+                                "rephrasing": "Try simplifying your question or specifying a different chart type."
+                            }
+                            
                             assistant_msg["val_log"] = route_a_result.validation_log
                             assistant_msg["sql"]     = route_a_result.sql
                         else:
@@ -615,13 +580,6 @@ else:
                             db_session=conn,
                         )
                         if not sql_result["success"]:
-                            # sql_engine.py's generate_safe_sql() already returns
-                            # a humanized, user-facing message in "error" (see
-                            # _humanize_error in sql_engine.py) — passed through
-                            # as-is rather than re-wrapped with a technical
-                            # prefix, so the downstream friendly-error pass
-                            # below explains the actual problem instead of
-                            # re-explaining a sentence that's already clear.
                             assistant_msg["error"] = sql_result["error"]
                             assistant_msg["sql"] = sql_result.get("sql")
                         else:
@@ -638,14 +596,8 @@ else:
                                     assistant_msg["error"] = f"Execution error: {e}"
                                     assistant_msg["sql"]   = sql
 
-                    # Compute friendly error once while spinner is still showing.
-                    # ddl_for_router is passed through as column_context so the
-                    # humanizer can name a specific data-type mismatch or a real
-                    # column name from the actual dataset, instead of speaking
-                    # generically about "a missing column" or "ambiguous question".
                     _stamp_friendly_error(assistant_msg, ddl_schema=ddl_for_router)
 
-                # Spinner is now closed — render is visible to the user
                 _render_assistant_message(assistant_msg)
 
             st.session_state.chat_history.append(assistant_msg)

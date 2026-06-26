@@ -78,6 +78,105 @@ try:
 except ImportError:
     SQL_MODEL = "qwen2.5-coder:1.5b"  
 
+try:
+    from config import ROUTER_MODEL
+except ImportError:
+    ROUTER_MODEL = "llama3.2:3b"
+
+
+# ── LLM-based error humanization ──────────────────────────────────────────────
+_ERROR_HUMANIZER_SYSTEM = """\
+You are a helpful data assistant that explains technical errors to non-technical users.
+
+You will be given:
+1. A technical error message from a data analytics system
+2. The user's original question
+3. Context about what the system was trying to do when the error occurred
+
+Your job is to write a single clear, friendly explanation (maximum 2 sentences) that:
+- Explains what went wrong in plain English that anyone can understand
+- Tells the user one specific thing they can try to fix it
+- NEVER mentions SQL, DuckDB, Ollama, Python, regex, HTTP, or any technical system names
+- NEVER says "the AI" — say "the system" instead
+- NEVER repeats or paraphrases the raw error message
+- NEVER uses bullet points, lists, or markdown formatting
+- NEVER adds a preamble like "Sure!" or "Of course!" — go straight to the explanation
+
+Output ONLY the plain-English explanation. Nothing else.
+"""
+
+_ERROR_HUMANIZER_USER = """\
+User's original question: {prompt}
+
+What the system was doing when the error occurred: {context}
+
+Technical error message: {error}
+
+Plain-English explanation for the user:
+"""
+
+def _humanize_error(
+    technical_msg: str,
+    prompt: str = "",
+    context: str = "generating a chart for your data",
+) -> str:
+    """
+    Convert a raw technical error string into a plain-English user-facing
+    message using llama3.2:3b (ROUTER_MODEL).
+    """
+    logger.debug("Raw technical error (before humanization): %s", technical_msg)
+
+    if re.search(
+        r"Cannot connect|Connection refused|ConnectionError|Failed to establish",
+        technical_msg,
+        re.IGNORECASE,
+    ):
+        return (
+            "The system couldn't reach the local AI model server. "
+            "Please make sure Ollama is running (`ollama serve`) and try again."
+        )
+
+    try:
+        user_payload = _ERROR_HUMANIZER_USER.format(
+            prompt=prompt or "not specified",
+            context=context,
+            error=technical_msg,
+        )
+        payload = {
+            "model":    ROUTER_MODEL,
+            "messages": [
+                {"role": "system", "content": _ERROR_HUMANIZER_SYSTEM},
+                {"role": "user",   "content": user_payload},
+            ],
+            "stream":  False,
+            "options": {
+                "temperature": 0.1,
+                "num_predict": 80,
+                "num_ctx":     512,
+            },
+        }
+        resp = requests.post(
+            f"{OLLAMA_BASE_URL}/api/chat",
+            json=payload,
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            explanation = resp.json()["message"]["content"].strip()
+            if explanation:
+                logger.debug("LLM humanized error: %s", explanation)
+                return explanation
+
+        logger.debug(
+            "Error humanization LLM returned status %d — falling back to raw message.",
+            resp.status_code,
+        )
+
+    except Exception as humanize_exc:
+        logger.debug("Error humanization LLM call failed: %s", humanize_exc)
+
+    cleaned = re.sub(r"^[\w.]+Error:\s*", "", technical_msg).strip()
+    return cleaned or "An unexpected error occurred. Please try again."
+
 
 def _qident(name: str) -> str:
     """Return a safely double-quoted DuckDB identifier (handles spaces & special chars)."""
@@ -102,14 +201,6 @@ class RouteAResult:
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Shared helper — build a column dictionary from live DuckDB metadata
-# ══════════════════════════════════════════════════════════════════════════════
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  Shared helper — build a column dictionary from live DuckDB metadata
-#
-#  NOTE: this now delegates straight to core.sql_engine._build_column_dict so
-#  Route A sees the exact same column dictionary as Route B — including the
-#  [DELIMITED with 'X'] flags for pipe/semicolon-joined VARCHAR columns.
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _build_column_dict(conn, tables: list[str]) -> str:
@@ -171,9 +262,6 @@ Available tables: {tables}
 User question: {question}
 """
 
-
-# Order matters: more specific terms (e.g. "donut") are checked before the
-# generic ones they could otherwise be mistaken for (e.g. "pie").
 _CHART_KEYWORDS: list[tuple[str, str]] = [
     (r"\bdonut\b", "donut"),
     (r"\bpie\s*(chart|graph)?\b", "pie"),
@@ -190,12 +278,6 @@ _CHART_KEYWORDS: list[tuple[str, str]] = [
 
 
 def _detect_explicit_chart_type(question: str) -> str | None:
-    """
-    Safety net for when a user explicitly names a chart/graph type
-    ("show me a pie chart of ...", "line graph of ...", "scatter plot
-    between ..."). The small local intent model sometimes ignores this
-    and defaults to 'bar' — this regex check catches it and always wins.
-    """
     q = question.lower()
     for pattern, chart_type in _CHART_KEYWORDS:
         if re.search(pattern, q):
@@ -203,11 +285,6 @@ def _detect_explicit_chart_type(question: str) -> str | None:
     return None
 
 
-# Some small local models put a computed expression like "average(quantity)"
-# or "AVG(quantity)" directly into x_axis/y_axis/group_by/order_by instead of
-# the plain column name "quantity" + aggregation:"avg". That breaks Layer 1
-# validation (the expression isn't a real column) even though the SQL itself
-# may be fine. This strips the wrapper and recovers the real column + agg.
 _AGG_WRAP_RE = re.compile(
     r'^\s*(avg|average|sum|total|count|min|minimum|max|maximum)\s*\(\s*"?'
     r'([^()"]+?)"?\s*\)\s*$',
@@ -223,8 +300,6 @@ _AGG_WORD_TO_CODE = {
 
 
 def _unwrap_agg_column(col: str | None) -> tuple[str | None, str | None]:
-    """Return (base_column_name, inferred_aggregation) — aggregation is
-    None if `col` wasn't wrapped in a function call."""
     if not col:
         return col, None
     m = _AGG_WRAP_RE.match(col)
@@ -234,14 +309,6 @@ def _unwrap_agg_column(col: str | None) -> tuple[str | None, str | None]:
 
 
 def _extract_intent(ddl: str, tables: list[str], question: str, conn=None) -> dict:
-    """
-    Stage 1: Call Ollama to extract chart intent from the user question.
-
-    Now accepts an optional `conn` (DuckDB connection) to build a live
-    column dictionary — prevents llama3.2:3b from hallucinating column names.
-    Falls back to DDL text if conn is not available.
-    """
-    # Build column dict from live DuckDB metadata when possible
     if conn and tables:
         column_dict = _build_column_dict(conn, tables)
     else:
@@ -262,7 +329,7 @@ def _extract_intent(ddl: str, tables: list[str], question: str, conn=None) -> di
         "messages": messages,
         "stream":   False,
         "format":   "json",
-        "options":  {"temperature": 0.0, "num_predict": 400},  # was 300
+        "options":  {"temperature": 0.0, "num_predict": 400},
     }
 
     print(
@@ -279,11 +346,9 @@ def _extract_intent(ddl: str, tables: list[str], question: str, conn=None) -> di
     resp.raise_for_status()
     raw = resp.json()["message"]["content"]
 
-    # Strip markdown fences if model adds them
     raw = re.sub(r"```json\s*|```", "", raw).strip()
     intent = json.loads(raw)
 
-    # Normalise chart_type and aggregation
     intent["chart_type"]  = str(intent.get("chart_type",  "")).lower()
     intent["aggregation"] = str(intent.get("aggregation", "none")).lower()
     _VALID_CHART_TYPES = (
@@ -299,8 +364,6 @@ def _extract_intent(ddl: str, tables: list[str], question: str, conn=None) -> di
     if intent["aggregation"] not in ("sum", "avg", "count", "min", "max", "none"):
         intent["aggregation"] = "none"
 
-    # Unwrap any axis the model expressed as a function call, e.g.
-    # y_axis: "average(quantity)" -> y_axis: "quantity", aggregation: "avg"
     for axis_key in ("x_axis", "y_axis", "group_by", "order_by"):
         base, inferred_agg = _unwrap_agg_column(intent.get(axis_key))
         if base != intent.get(axis_key):
@@ -312,13 +375,10 @@ def _extract_intent(ddl: str, tables: list[str], question: str, conn=None) -> di
             if inferred_agg and intent["aggregation"] == "none":
                 intent["aggregation"] = inferred_agg
 
-    # If the user explicitly named a chart/graph type in plain English,
-    # that always wins over the model's guess (handles "any kind of graph").
     explicit_chart = _detect_explicit_chart_type(question)
     if explicit_chart:
         intent["chart_type"] = explicit_chart
 
-    # Resolve / validate the chosen table against the actual list of tables
     chosen_table = str(intent.get("table") or "").strip()
     table_lookup = {t.lower(): t for t in tables}
     if chosen_table.lower() in table_lookup:
@@ -416,7 +476,6 @@ Output ONLY the raw SQL, nothing else.
 
 
 def _extract_sql_from_response(raw: str) -> str | None:
-    """Pull the first SELECT/WITH block out of a model response."""
     raw = re.sub(r"```sql\s*|```", "", raw, flags=re.I).strip()
     m = re.search(r"(SELECT|WITH)\b[\s\S]*", raw, flags=re.I)
     if not m:
@@ -437,14 +496,6 @@ def _generate_sql(
     question: str,
     conn=None,
 ) -> str | None:
-    """
-    Stage 2: Call Ollama (SQL model) to generate a DuckDB SELECT query.
-
-    Now accepts an optional `conn` to build a live column dictionary,
-    uses num_predict=1024 (was 512), and includes a self-repair pass
-    on DuckDB EXPLAIN failure.
-    """
-    # Build column dict from live DuckDB metadata when possible
     if conn and tables:
         column_dict = _build_column_dict(conn, tables)
     else:
@@ -488,12 +539,9 @@ def _generate_sql(
         print(f"   {_RED}No valid SQL extracted{_R}\n{_BOLD}{_BLUE}└──{_R}", flush=True)
         return None
 
-    # Same regex safety nets as sql_engine.py: TRY_CAST enforcement +
-    # decimal-point-stripping fix, so both routes harden SQL identically.
     sql = _harden_sql(sql)
     logger.info("SQL first attempt: %s…", sql[:100])
 
-    # ── Self-repair pass (3 attempts — same as sql_engine.py) ─────────────────
     if conn:
         max_repairs = 3
         repair_messages = list(messages)
@@ -551,14 +599,6 @@ def _generate_sql(
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _validate_sql(conn, sql: str, table: str, tables: list[str], intent: dict) -> tuple[bool, list[str]]:
-    """
-    Three-layer validation:
-      Layer 1 — Column existence check (x_axis, y_axis present in any loaded table)
-      Layer 2 — DuckDB EXPLAIN pre-flight (catches syntax errors without reading data)
-      Layer 3 — Result shape check (non-empty, correct column count)
-
-    Returns (passed: bool, log: list[str])
-    """
     log: list[str] = []
 
     print(
@@ -566,7 +606,6 @@ def _validate_sql(conn, sql: str, table: str, tables: list[str], intent: dict) -
         flush=True,
     )
 
-    # ── Layer 1: Column existence ──────────────────────────────────────────────
     try:
         target_cols: set[str] = set(
             row[0].lower()
@@ -585,10 +624,6 @@ def _validate_sql(conn, sql: str, table: str, tables: list[str], intent: dict) -
             except Exception:
                 pass
 
-        # Aggregation aliases the LLM may return as y_axis/x_axis —
-        # these are computed by the SQL itself, not real table columns,
-        # so Layer 1 must not reject them. Layer 2 (EXPLAIN) catches
-        # any real SQL errors involving these names.
         _COMPUTED_ALIASES = {
             "count", "total", "average", "avg", "sum", "min", "max",
             "frequency", "percent", "pct", "ratio", "rate", "rank",
@@ -599,18 +634,13 @@ def _validate_sql(conn, sql: str, table: str, tables: list[str], intent: dict) -
             col = intent.get(axis)
             if not col:
                 continue
-            # Unwrap wrapped expressions like "average(quantity)" → "quantity"
             unwrapped, _ = _unwrap_agg_column(col)
             col_l = unwrapped.lower().strip()
 
-            # Skip validation if it is a known computed alias — it does not
-            # exist as a table column; it is produced by the SQL aggregation.
             if col_l in _COMPUTED_ALIASES:
                 log.append(f"Layer 1 SKIP: '{col}' is a computed alias, not a table column")
                 continue
 
-            # Skip validation if the intent also specifies an aggregation —
-            # the LLM returned the alias name rather than the source column.
             if intent.get("aggregation") and intent.get("aggregation") != "none":
                 if axis == "y_axis":
                     log.append(f"Layer 1 SKIP: '{col}' is y_axis with aggregation '{intent['aggregation']}' — alias, not a table column")
@@ -639,7 +669,6 @@ def _validate_sql(conn, sql: str, table: str, tables: list[str], intent: dict) -
         print(f"   {_RED}{msg}{_R}\n{_BOLD}{_BLUE}└──{_R}", flush=True)
         return False, log
 
-    # ── Layer 2: DuckDB EXPLAIN pre-flight ────────────────────────────────────
     try:
         conn.execute(f"EXPLAIN {sql}")
         log.append("Layer 2 PASS: DuckDB EXPLAIN succeeded")
@@ -650,7 +679,6 @@ def _validate_sql(conn, sql: str, table: str, tables: list[str], intent: dict) -
         print(f"   {_RED}{msg}{_R}\n{_BOLD}{_BLUE}└──{_R}", flush=True)
         return False, log
 
-    # ── Layer 3: Result shape check ───────────────────────────────────────────
     try:
         probe = conn.execute(f"SELECT * FROM ({sql.rstrip(';')}) __probe LIMIT 1").df()
         if probe.empty:
@@ -696,10 +724,6 @@ def _execute_sql(conn, sql: str) -> pd.DataFrame:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _build_chart(df: pd.DataFrame, intent: dict) -> go.Figure:
-    """
-    Build a Plotly figure from the result DataFrame + intent spec.
-    Falls back gracefully if columns don't match.
-    """
     chart_type = intent.get("chart_type", "bar")
     x_col      = intent.get("x_axis")
     y_col      = intent.get("y_axis")
@@ -708,9 +732,6 @@ def _build_chart(df: pd.DataFrame, intent: dict) -> go.Figure:
     y_label    = intent.get("y_label") or y_col or ""
     group_col  = intent.get("group_by")
 
-    # Resolve columns case-insensitively against actual DataFrame columns.
-    # Also tolerant of an aggregate-shaped alias (e.g. "average(quantity)")
-    # in case the SQL model didn't follow the plain-alias instruction.
     cols_lower = {c.lower(): c for c in df.columns}
     agg = intent.get("aggregation") or "none"
 
@@ -890,7 +911,6 @@ def _build_chart(df: pd.DataFrame, intent: dict) -> go.Figure:
         logger.warning("Chart build failed (%s)", e)
         raise
 
-    # Consistent layout polish
     fig.update_layout(
         plot_bgcolor="rgba(0,0,0,0)",
         paper_bgcolor="rgba(0,0,0,0)",
@@ -903,7 +923,6 @@ def _build_chart(df: pd.DataFrame, intent: dict) -> go.Figure:
 
 
 def _fallback_bar(df: pd.DataFrame, title: str) -> go.Figure:
-    """Last-resort bar chart using first two columns."""
     if df.empty:
         return go.Figure().update_layout(title=title or "No data")
     cols = list(df.columns)
@@ -922,24 +941,10 @@ def run(
     prompt: str,
     router_intent: dict | None = None,
 ) -> RouteAResult:
-    """
-    Execute the full Route A visualization pipeline.
-
-    Args:
-        conn          : DuckDB connection
-        tables        : list of available table names
-        prompt        : user's natural language question
-        router_intent : partial intent already extracted by the query router
-                        (chart_type, x_axis, y_axis, aggregation). If provided,
-                        Stage 1 is still called to fill in missing fields.
-
-    Returns RouteAResult with .fig (Plotly Figure), .df, .sql, .intent, etc.
-    """
     primary_table = tables[0] if tables else ""
     if not primary_table:
         return RouteAResult(success=False, error="No tables loaded.")
 
-    # Build DDL for any callers that still need it (kept for compatibility)
     ddl = generate_multi_table_ddl(
         conn, tables, redact=False, max_columns=DDL_MAX_COLUMNS
     )
@@ -959,28 +964,26 @@ def run(
         if router_intent and router_intent.get("chart_type"):
             intent = dict(router_intent)
             try:
-                # Enrich with full intent (filters, labels, limit, etc.)
                 full_intent = _extract_intent(ddl, tables, prompt, conn=conn)
-                # Router values take priority for chart_type/axes
                 full_intent.update({
                     k: v for k, v in intent.items()
                     if v is not None and k in ("chart_type", "x_axis", "y_axis", "aggregation")
                 })
                 intent = full_intent
             except Exception:
-                pass  # use router intent as-is if Ollama fails
+                pass  
         else:
             intent = _extract_intent(ddl, tables, prompt, conn=conn)
 
         result.intent        = intent
         result.stage_reached = "intent"
     except Exception as e:
-        result.error = f"Stage 1 (Intent Extraction) failed: {e}"
-        logger.error(result.error, exc_info=True)
-        _print_fail(result.error)
+        technical = f"Stage 1 (Intent Extraction) failed: {e}"
+        logger.error(technical, exc_info=True)
+        _print_fail(technical)
+        result.error = _humanize_error(technical, prompt, "understanding what kind of chart you want to build")
         return result
 
-    # Resolve the chosen table (falls back to first table if LLM returned invalid name)
     table_lookup = {t.lower(): t for t in tables}
     target_table = table_lookup.get(str(intent.get("table") or "").lower(), primary_table)
     intent["table"] = target_table
@@ -989,15 +992,18 @@ def run(
     try:
         sql = _generate_sql(ddl, target_table, tables, intent, prompt, conn=conn)
         if not sql:
-            result.error = "Stage 2 (SQL Generation) produced no valid SQL."
-            _print_fail(result.error)
+            technical = "Stage 2 (SQL Generation) produced no valid SQL."
+            _print_fail(technical)
+            result.error = _humanize_error(technical, prompt, "writing the database query for your chart")
             return result
+            
         result.sql           = sql
         result.stage_reached = "sql"
     except Exception as e:
-        result.error = f"Stage 2 (SQL Generation) failed: {e}"
-        logger.error(result.error, exc_info=True)
-        _print_fail(result.error)
+        technical = f"Stage 2 (SQL Generation) failed: {e}"
+        logger.error(technical, exc_info=True)
+        _print_fail(technical)
+        result.error = _humanize_error(technical, prompt, "writing the database query for your chart")
         return result
 
     # ── Stage 3: Three-layer Validation ──────────────────────────────────────
@@ -1005,8 +1011,9 @@ def run(
     result.validation_log = log
     result.stage_reached  = "validation"
     if not passed:
-        result.error = "Stage 3 (Validation) failed. " + (log[-1] if log else "")
-        _print_fail(result.error)
+        technical = "Stage 3 (Validation) failed. " + (log[-1] if log else "")
+        _print_fail(technical)
+        result.error = _humanize_error(technical, prompt, "checking if the generated query is safe to run")
         return result
 
     # ── Stage 4: DuckDB Execution ─────────────────────────────────────────────
@@ -1015,9 +1022,10 @@ def run(
         result.df            = df
         result.stage_reached = "execution"
     except Exception as e:
-        result.error = f"Stage 4 (DuckDB Execution) failed: {e}"
-        logger.error(result.error, exc_info=True)
-        _print_fail(result.error)
+        technical = f"Stage 4 (DuckDB Execution) failed: {e}"
+        logger.error(technical, exc_info=True)
+        _print_fail(technical)
+        result.error = _humanize_error(technical, prompt, "fetching the data for your chart")
         return result
 
     # ── Stage 5: Visualization Builder ───────────────────────────────────────
@@ -1035,9 +1043,10 @@ def run(
             flush=True,
         )
     except Exception as e:
-        result.error = f"Stage 5 (Visualization) failed: {e}"
-        logger.error(result.error, exc_info=True)
-        _print_fail(result.error)
+        technical = f"Stage 5 (Visualization) failed: {e}"
+        logger.error(technical, exc_info=True)
+        _print_fail(technical)
+        result.error = _humanize_error(technical, prompt, "drawing the chart with the fetched data")
         return result
 
     return result
@@ -1048,25 +1057,3 @@ def _print_fail(msg: str) -> None:
         f"\n{_RED}{_BOLD}  ROUTE A FAILED: {msg}{_R}\n",
         flush=True,
     )
-
-
-
-# User question
-#     │
-#     ▼
-# Stage 1: Intent Extraction      (llama3.2:3b)
-#     │   "what chart type? which columns? which table?"
-#     ▼
-# Stage 2: SQL Generation         (qwen2.5-coder:7b)
-#     │   writes a DuckDB SELECT query
-#     ▼
-# Stage 3: 3-Layer Validation
-#     │   Layer 1 → column existence check
-#     │   Layer 2 → DuckDB EXPLAIN (syntax check, no data read)
-#     │   Layer 3 → result shape check (non-empty, correct cols)
-#     ▼
-# Stage 4: DuckDB Execution
-#     │   runs the validated SQL, gets a DataFrame
-#     ▼
-# Stage 5: Plotly Chart Builder
-#         outputs a go.Figure
