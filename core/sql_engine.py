@@ -25,6 +25,10 @@
 #      mistake of list_contains(UNNEST(STRING_SPLIT(...))) in WHERE clauses,
 #      which DuckDB rejects. Enforced in code since self-repair consistently
 #      fails to break this habit across all 3 repair attempts.
+#  11. _humanize_error: converts raw technical error strings (DuckDB errors,
+#      Ollama errors, internal errors) into plain-English user-facing messages
+#      before returning them. Raw technical detail is still logged for
+#      debugging; only the human-readable version surfaces in the UI.
 
 import logging
 import re
@@ -138,6 +142,130 @@ REPAIR INSTRUCTIONS:
 Write a corrected DuckDB SQL query that fixes this error exactly.
 Output ONLY the raw SQL, nothing else.
 """
+
+# ── Natural-language error translation ────────────────────────────────────────
+# Maps technical error patterns to plain-English messages shown to the user.
+# Raw technical detail is still logged separately for debugging.
+# Order matters — more specific patterns should come before generic ones.
+_ERROR_TRANSLATIONS: list[tuple[str, str]] = [
+    # Ollama connectivity
+    (
+        r"Cannot connect to Ollama|Connection refused|ConnectionError",
+        "The AI model server isn't running. Please start Ollama with "
+        "`ollama serve` and try again.",
+    ),
+    (
+        r"took longer than \d+s|Timeout|timed out",
+        "The AI model took too long to respond — it may still be loading "
+        "into memory on first use. Please try again in a moment, or raise "
+        "OLLAMA_TIMEOUT in config.py if this happens consistently.",
+    ),
+    (
+        r"Ollama returned HTTP 404|model.*not found|try pulling",
+        "The AI model couldn't be found in Ollama. "
+        "Run `ollama list` to see what's available, then update SQL_MODEL "
+        "in config.py to match one of those names.",
+    ),
+    (
+        r"Ollama returned HTTP 500",
+        "The AI model server encountered an internal error. This usually means "
+        "the model ran out of memory. Try closing other applications and "
+        "restarting Ollama.",
+    ),
+    (
+        r"Ollama returned HTTP",
+        "The AI model server returned an unexpected error. "
+        "Check the terminal where Ollama is running for details.",
+    ),
+    # SQL generation failures
+    (
+        r"Model response contained no valid SQL",
+        "The AI didn't produce a valid query for your question. "
+        "Try rephrasing it more specifically — for example, mention "
+        "the exact column names or values you're interested in.",
+    ),
+    (
+        r"Ollama call failed",
+        "The AI model failed to respond. Please check that Ollama is "
+        "running and try again.",
+    ),
+    # DuckDB validation errors
+    (
+        r"Referenced column.*not found|column.*does not exist",
+        "The AI referenced a column that doesn't exist in your data. "
+        "Try rephrasing your question using the exact column names shown "
+        "in the schema (use the metadata route to see column names).",
+    ),
+    (
+        r"UNNEST not supported here",
+        "The AI generated a query with an unsupported pattern for a "
+        "multi-value column. This has been automatically fixed — please "
+        "try your question again.",
+    ),
+    (
+        r"Binder Error",
+        "The AI generated a query that references something that doesn't "
+        "exist in your data. Try rephrasing your question more specifically.",
+    ),
+    (
+        r"Parser Error|syntax error",
+        "The AI generated a query with a syntax error that couldn't be "
+        "automatically repaired after 3 attempts. Try rephrasing your "
+        "question more specifically.",
+    ),
+    (
+        r"Conversion Error|could not convert",
+        "The query ran into values in your data that couldn't be converted "
+        "to the expected type (e.g. text where a number was expected). "
+        "Try filtering to cleaner rows or rephrasing your question.",
+    ),
+    (
+        r"contains a disallowed keyword",
+        "The AI generated a query that was blocked by the safety validator. "
+        "Try rephrasing your question.",
+    ),
+    (
+        r"Only SELECT and WITH queries are allowed",
+        "The AI attempted to modify your data instead of just reading it. "
+        "This has been blocked. Please rephrase your question as a "
+        "read-only data question.",
+    ),
+    (
+        r"references unknown table",
+        "The AI referenced a table that isn't loaded in your session. "
+        "Check the sidebar to confirm which files are loaded, then try again.",
+    ),
+    (
+        r"could not be parsed or validated by DuckDB",
+        "The query couldn't be validated — it may contain a syntax error "
+        "or reference something that doesn't exist. Try rephrasing your question.",
+    ),
+]
+
+
+def _humanize_error(technical_msg: str) -> str:
+    """
+    Convert a raw technical error string into a plain-English user-facing
+    message. Logs the original technical message at DEBUG level so it's
+    still available for debugging without cluttering the UI.
+
+    Falls through to the original message if no pattern matches, which is
+    better than a generic "something went wrong" for unexpected error types.
+    """
+    if not technical_msg:
+        return "An unexpected error occurred. Please try again."
+
+    logger.debug("Raw technical error (before humanization): %s", technical_msg)
+
+    for pattern, human_msg in _ERROR_TRANSLATIONS:
+        if re.search(pattern, technical_msg, re.IGNORECASE):
+            return human_msg
+
+    # No pattern matched — return the original so at least it's honest,
+    # but strip internal Python exception class names from the front.
+    cleaned = re.sub(r"^[\w]+Error:\s*", "", technical_msg).strip()
+    return cleaned or technical_msg
+
 
 # ── Delimiter detection ────────────────────────────────────────────────────────
 _DELIMITER_CANDIDATES  = ["|", ";", "/", ">"]
@@ -306,7 +434,7 @@ def _fix_decimal_stripping(sql: str) -> str:
                 expr   = args[0].strip()
                 result = result[:match.start()] + expr + result[close_idx + 1:]
                 changed = True
-                break  # string indices shifted — restart scan
+                break
 
         if not changed:
             break
@@ -326,10 +454,8 @@ def _fix_unnest_in_where(sql: str) -> str:
           → list_contains(STRING_SPLIT(col, 'X'), ...)
 
     DuckDB does not support UNNEST inside a WHERE clause or inside
-    list_contains(). The model generates this pattern frequently because
-    it confuses the SELECT-clause UNNEST usage (valid) with the WHERE-clause
-    usage (invalid). Three rounds of self-repair consistently fail to break
-    this habit, so it is enforced deterministically here instead.
+    list_contains(). Enforced deterministically since self-repair
+    consistently fails to break this habit across all 3 attempts.
     """
     before = sql
     sql = _UNNEST_IN_LIST_CONTAINS.sub(
@@ -344,8 +470,7 @@ def _fix_unnest_in_where(sql: str) -> str:
 def _harden_sql(sql: str) -> str:
     """
     Apply all deterministic post-generation safety rewrites.
-    Logs a before/after when any rewrite actually fires so it's visible
-    whether the model needed correction or wrote correct SQL on its own.
+    Logs a before/after when any rewrite actually fires.
     """
     before = sql
     sql = _fix_decimal_stripping(sql)
@@ -393,16 +518,20 @@ def _print_fail(msg: str) -> None:
 
 def generate_safe_sql(
     prompt: str,
-    ddl_schema: str,       # kept for backward-compatibility; used only when conn is None
-    table_name: str,       # comma-separated table names
-    db_session=None,       # DuckDB connection — used to build live column dict
+    ddl_schema: str,
+    table_name: str,
+    db_session=None,
 ) -> dict:
     """
     Generate a valid DuckDB SELECT query for *prompt*.
 
     Returns:
         {"success": True,  "sql": "<query>"}
-        {"success": False, "error": "<message>"}
+        {"success": False, "error": "<plain-English user-facing message>"}
+
+    All error messages returned in the "error" key are plain English,
+    suitable for display directly in the UI. Raw technical detail is
+    logged at DEBUG/WARNING level for terminal debugging.
     """
     conn       = db_session
     all_tables = [t.strip() for t in table_name.split(",") if t.strip()] if table_name else []
@@ -436,27 +565,28 @@ def generate_safe_sql(
     # ── First attempt ─────────────────────────────────────────────────────────
     try:
         raw = _call_ollama(messages)
-    except requests.exceptions.ConnectionError:
-        msg = (
-            f"Cannot connect to Ollama at {OLLAMA_BASE_URL}. "
-            "Make sure Ollama is running: `ollama serve`"
-        )
-        logger.error(msg)
-        _print_fail(msg)
-        return {"success": False, "error": msg}
-    except requests.exceptions.Timeout:
-        msg = f"Ollama took longer than {OLLAMA_TIMEOUT}s to respond."
-        logger.error(msg)
-        _print_fail(msg)
-        return {"success": False, "error": msg}
+    except requests.exceptions.ConnectionError as e:
+        technical = f"Cannot connect to Ollama at {OLLAMA_BASE_URL}: {e}"
+        logger.error(technical)
+        _print_fail(technical)
+        return {"success": False, "error": _humanize_error(technical)}
+    except requests.exceptions.Timeout as e:
+        technical = f"Ollama took longer than {OLLAMA_TIMEOUT}s to respond: {e}"
+        logger.error(technical)
+        _print_fail(technical)
+        return {"success": False, "error": _humanize_error(technical)}
     except Exception as e:
-        _print_fail(f"Ollama call failed: {e}")
-        return {"success": False, "error": f"Ollama call failed: {e}"}
+        technical = f"Ollama call failed: {e}"
+        logger.error(technical)
+        _print_fail(technical)
+        return {"success": False, "error": _humanize_error(technical)}
 
     sql = _extract_sql(raw)
     if not sql:
-        _print_fail("Model response contained no valid SQL.")
-        return {"success": False, "error": "Model response contained no valid SQL."}
+        technical = "Model response contained no valid SQL."
+        logger.warning("%s Raw response (first 200 chars): %s", technical, raw[:200])
+        _print_fail(technical)
+        return {"success": False, "error": _humanize_error(technical)}
 
     sql = _harden_sql(sql)
     logger.info("SQL first attempt (%d chars): %s…", len(sql), sql[:100])
@@ -469,13 +599,13 @@ def generate_safe_sql(
             flush=True,
         )
 
-        max_repairs    = 3
-        repair_messages = list(messages)   # maintain full conversation history across retries
+        max_repairs     = 3
+        repair_messages = list(messages)
+        last_explain_err = None   # track the final EXPLAIN error for humanization
 
         for attempt in range(1, max_repairs + 1):
             try:
                 conn.execute(f"EXPLAIN {sql}")
-                # EXPLAIN passed — SQL is syntactically valid
                 if attempt == 1:
                     logger.info("SQL passed EXPLAIN on first attempt.")
                     print(
@@ -490,9 +620,12 @@ def generate_safe_sql(
                         f"{_BOLD}{_BLUE}└──{_R}",
                         flush=True,
                     )
+                last_explain_err = None
                 break
 
             except Exception as explain_err:
+                last_explain_err = str(explain_err)
+
                 if attempt == max_repairs:
                     logger.warning(
                         "Self-repair exhausted after %d attempts (%s) — "
@@ -531,7 +664,7 @@ def generate_safe_sql(
                     raw_repair = _call_ollama(repair_messages, max_tokens=1024)
                     repaired   = _extract_sql(raw_repair)
                     if repaired:
-                        sql = _harden_sql(repaired)   # harden repair output too
+                        sql = _harden_sql(repaired)
                     else:
                         logger.warning("Self-repair produced no valid SQL.")
                         print(
