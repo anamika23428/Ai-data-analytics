@@ -88,6 +88,41 @@ VALID route values — use ONLY these four, nothing else:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DEFAULT TIEBREAKER — READ THIS BEFORE CLASSIFYING:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+"sql_answer" is the DEFAULT route for any question about specific rows,
+records, rankings, or simple aggregated numbers. Do NOT classify a question
+as "metadata" or "statistical" just because it does not contain an obvious
+SQL_ANSWER keyword — the absence of a trigger word is NOT evidence for
+"metadata" or "statistical". Those two routes require POSITIVE evidence of
+their own specific criteria, listed below. When in doubt between sql_answer
+and anything else, choose sql_answer.
+
+- Choose "metadata" ONLY if the question is asking what EXISTS in the
+  dataset's structure or contents in the abstract — column names, data
+  types, schema, OR an unconditional enumeration of every distinct value in
+  a column (e.g. "what are all the distinct cities"). A question asking for
+  a RANKED or LIMITED subset of actual data rows — "top N", "the highest
+  X", "the most popular Y", "the best-selling Z" — is NEVER metadata, even
+  though it contains words like "list" or "show" that also appear in
+  metadata examples. The presence of a NUMBER (top 5, top 10) or a
+  SUPERLATIVE (highest, best, most, least) describing actual data values is
+  itself positive evidence for "sql_answer", not metadata.
+
+- Choose "statistical" ONLY if the question requires a calculation beyond
+  a single SUM/AVG/COUNT/MIN/MAX/GROUP BY/ORDER BY — i.e. it needs a
+  percentile, z-score, standard deviation, correlation, regression, outlier
+  detection, or window/ranking function, OR it asks for a narrative
+  explanation/business insight rather than a number or a list. A question
+  that can be fully answered with one simple SELECT (with an optional
+  GROUP BY, ORDER BY, or LIMIT) is "sql_answer", no matter how the question
+  is phrased. Ranking, sorting, or limiting a result set ("top 10 selling
+  products", "the 5 highest-rated items") is a simple ORDER BY + LIMIT —
+  this is "sql_answer", NOT "statistical", even though ranking sounds
+  analytical.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ROUTE DEFINITIONS — choose the single best fit:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -131,6 +166,9 @@ Examples (simple aggregation):
   "sum of discounts given per city"
   "count of orders per day"
   "which city has the most customers"
+  "list the top 10 selling products"        ← sql_answer, NOT metadata
+  "show the 5 highest-rated items"          ← sql_answer, NOT statistical
+  "what are the best-selling categories"    ← sql_answer, NOT metadata
 
 "metadata"
 → User wants to explore what EXISTS in the data — unique values, distinct
@@ -231,7 +269,23 @@ CRITICAL ROUTING RULES — NEVER VIOLATE THESE:
    Do NOT output "reasoning", "analytical", "lookup", "record_lookup",
    "aggregation", or any other label not in the valid list.
 
-9. Output ONLY the JSON object. No markdown, no backticks, no text outside JSON.
+9. The absence of an exclusion word (who/where/with/that/above/below) does
+   NOT make a question "metadata" by default, and the absence of an
+   obvious aggregation keyword (total/average/sum) does NOT make a
+   question "statistical" by default. "sql_answer" is the default for any
+   question about specific rows, rankings, or simple aggregated numbers.
+   "metadata" and "statistical" each require POSITIVE evidence of their
+   own specific criteria (see DEFAULT TIEBREAKER above) — never choose
+   them just because nothing else seemed to fit.
+
+10. "list/show/give the top N <anything> <noun>", "the N highest/lowest/
+    best/worst <noun>", "best-selling", "most popular", "top-rated" — these
+    describe a RANKED SUBSET OF ACTUAL DATA ROWS. They are ALWAYS
+    "sql_answer" (a simple ORDER BY + LIMIT), never "metadata" (which only
+    covers unconditional structural enumeration) and never "statistical"
+    (which requires a calculation beyond a single aggregation).
+
+11. Output ONLY the JSON object. No markdown, no backticks, no text outside JSON.
 """
 
 
