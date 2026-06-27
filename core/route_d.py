@@ -18,6 +18,7 @@
 #   _harden_sql         – TRY_CAST upgrade + decimal-strip removal
 #   _call_ollama        – unified Ollama HTTP call with error handling
 #   _REPAIR_TEMPLATE    – self-repair prompt template
+#   _humanize_error     – LLM-based error translation (llama3.2:3b)
 # ─────────────────────────────────────────────────────────────────────────────
 
 from __future__ import annotations
@@ -44,6 +45,7 @@ from core.sql_engine import (
     _harden_sql,
     _call_ollama,
     _REPAIR_TEMPLATE,
+    _humanize_error,
 )
 
 logger = logging.getLogger(__name__)
@@ -64,8 +66,6 @@ class RouteDResult:
 
 # ─── Prompts ──────────────────────────────────────────────────────────────────
 
-# Route D has its own system prompt — statistical focus differs from Route B's
-# plain lookup focus, so they intentionally have separate prompts.
 _STAT_SYSTEM_PROMPT = """\
 You are an expert DuckDB SQL developer specialising in statistical and analytical queries.
 Your only job is to write a single valid DuckDB SELECT query that answers the user's request.
@@ -129,6 +129,11 @@ def _generate_sql(prompt: str, column_dict: str, tables: list[str], conn) -> dic
     """
     Generate DuckDB SQL via Ollama with up to 3 self-repair attempts on
     EXPLAIN failure — identical repair strategy to sql_engine (Route B).
+
+    All error strings returned in {"success": False, "error": ...} are
+    already humanized via _humanize_error before being returned, so callers
+    can surface them directly in the UI without further processing.
+
     Returns {"success": True, "sql": "..."} or {"success": False, "error": "..."}.
     """
     user_payload = _STAT_USER_TEMPLATE.format(
@@ -143,20 +148,36 @@ def _generate_sql(prompt: str, column_dict: str, tables: list[str], conn) -> dic
     # ── First attempt ─────────────────────────────────────────────────────────
     try:
         raw = _call_ollama(messages)
-    except requests.exceptions.ConnectionError:
-        msg = f"Cannot connect to Ollama at {OLLAMA_BASE_URL}."
-        logger.error(msg)
-        return {"success": False, "error": msg}
-    except requests.exceptions.Timeout:
-        msg = f"Ollama timed out after {OLLAMA_TIMEOUT}s."
-        logger.error(msg)
-        return {"success": False, "error": msg}
+    except requests.exceptions.ConnectionError as exc:
+        technical = f"Cannot connect to Ollama at {OLLAMA_BASE_URL}: {exc}"
+        logger.error(technical)
+        return {"success": False, "error": _humanize_error(
+            technical, prompt=prompt,
+            context="connecting to the AI model server for statistical analysis",
+        )}
+    except requests.exceptions.Timeout as exc:
+        technical = f"Ollama timed out after {OLLAMA_TIMEOUT}s: {exc}"
+        logger.error(technical)
+        return {"success": False, "error": _humanize_error(
+            technical, prompt=prompt,
+            context="waiting for the AI model to respond during statistical analysis",
+        )}
     except Exception as exc:
-        return {"success": False, "error": f"Ollama call failed: {exc}"}
+        technical = f"Ollama call failed: {exc}"
+        logger.error(technical)
+        return {"success": False, "error": _humanize_error(
+            technical, prompt=prompt,
+            context="calling the AI model to generate a statistical query",
+        )}
 
     sql = _extract_sql(raw)
     if not sql:
-        return {"success": False, "error": "Model returned no valid SQL."}
+        technical = "Model returned no valid SQL."
+        logger.warning("%s Raw response (first 200 chars): %s", technical, raw[:200])
+        return {"success": False, "error": _humanize_error(
+            technical, prompt=prompt,
+            context="asking the AI model to generate a statistical SQL query",
+        )}
 
     sql = _harden_sql(sql)
     logger.info("Route D SQL first attempt: %s…", sql[:120])
@@ -169,13 +190,19 @@ def _generate_sql(prompt: str, column_dict: str, tables: list[str], conn) -> dic
         try:
             conn.execute(f"EXPLAIN {sql}")
             logger.info("Route D SQL passed EXPLAIN (attempt %d).", attempt)
-            break  # valid — exit loop
+            break
         except Exception as explain_err:
             if attempt == max_repairs:
-                logger.warning("Route D self-repair exhausted after %d attempts: %s", max_repairs, explain_err)
+                logger.warning(
+                    "Route D self-repair exhausted after %d attempts: %s",
+                    max_repairs, explain_err,
+                )
                 break
 
-            logger.warning("Route D EXPLAIN failed (attempt %d): %s — retrying…", attempt, explain_err)
+            logger.warning(
+                "Route D EXPLAIN failed (attempt %d): %s — retrying…",
+                attempt, explain_err,
+            )
             repair_payload = _REPAIR_TEMPLATE.format(error=str(explain_err), sql=sql)
             repair_messages.append({"role": "assistant", "content": sql})
             repair_messages.append({"role": "user",      "content": repair_payload})
@@ -252,7 +279,7 @@ def run(
     conn,
     tables: list[str],
     prompt: str,
-    ddl_schema: str | None = None,   # kept for API compatibility, no longer used
+    ddl_schema: str | None = None,
     route_label: str = "statistical",
 ) -> RouteDResult:
     """
@@ -262,19 +289,27 @@ def run(
       3. Safety-validate SQL
       4. Execute against DuckDB
       5. Generate AI observation (only on non-empty results)
+
+    All error strings in RouteDResult.error are plain-English messages
+    generated by llama3.2:3b via _humanize_error, suitable for direct
+    display in the UI without further processing.
     """
     if not tables:
-        return RouteDResult(success=False, route=route_label, error="No tables loaded.")
+        return RouteDResult(
+            success=False, route=route_label,
+            error="No data tables are loaded. Please upload a file from the sidebar first.",
+        )
 
-    # ── Step 1: Build column dict (live DESCRIBE, same quality as Route B) ────
+    # ── Step 1: Build column dict ─────────────────────────────────────────────
     column_dict = _build_column_dict(conn, tables)
 
     # ── Step 2: Generate + self-repair SQL ────────────────────────────────────
     sql_result = _generate_sql(prompt, column_dict, tables, conn)
     if not sql_result["success"]:
+        # error is already humanized inside _generate_sql
         return RouteDResult(
             success=False, route=route_label,
-            error=f"SQL generation failed: {sql_result['error']}",
+            error=sql_result["error"],
         )
 
     sql = sql_result["sql"]
@@ -284,7 +319,10 @@ def run(
     if not ok:
         return RouteDResult(
             success=False, route=route_label,
-            error=f"SQL validation failed: {reason}",
+            error=_humanize_error(
+                reason, prompt=prompt,
+                context="checking the generated query for safety before running it",
+            ),
             sql=sql,
         )
 
@@ -292,17 +330,25 @@ def run(
     try:
         df = conn.execute(sql).df()
     except Exception as exc:
-        logger.error("Route D execution error: %s", exc)
+        technical = str(exc)
+        logger.error("Route D execution error: %s", technical)
         return RouteDResult(
             success=False, route=route_label,
-            error=f"Query execution failed: {exc}",
+            error=_humanize_error(
+                technical, prompt=prompt,
+                context="running the statistical query against your data",
+            ),
             sql=sql,
         )
 
     if df.empty:
         return RouteDResult(
             success=True, route=route_label,
-            answer="The query ran successfully but returned no rows.",
+            answer=(
+                "The query ran successfully but found no matching rows. "
+                "Try broadening your question or checking that the values "
+                "you're filtering on actually exist in the data."
+            ),
             dataframe=df,
             sql=sql,
         )
@@ -310,12 +356,39 @@ def run(
     # ── Step 5: AI observation ────────────────────────────────────────────────
     try:
         observation = _generate_observation(prompt, sql, df)
-    except Exception as exc:
-        logger.error("Route D observation failed: %s", exc)
+    except requests.exceptions.ConnectionError as exc:
+        technical = f"Cannot connect to Ollama at {OLLAMA_BASE_URL}: {exc}"
+        logger.error(technical)
         return RouteDResult(
-            success=False,
-            route=route_label,
-            error=f"The query ran successfully but the AI observation step failed: {exc}",
+            success=False, route=route_label,
+            error=_humanize_error(
+                technical, prompt=prompt,
+                context="connecting to the AI model server to generate an observation",
+            ),
+            dataframe=df,
+            sql=sql,
+        )
+    except requests.exceptions.Timeout as exc:
+        technical = f"Ollama timed out after {OLLAMA_TIMEOUT}s during observation: {exc}"
+        logger.error(technical)
+        return RouteDResult(
+            success=False, route=route_label,
+            error=_humanize_error(
+                technical, prompt=prompt,
+                context="waiting for the AI model to generate an observation about the results",
+            ),
+            dataframe=df,
+            sql=sql,
+        )
+    except Exception as exc:
+        technical = str(exc)
+        logger.error("Route D observation failed: %s", technical)
+        return RouteDResult(
+            success=False, route=route_label,
+            error=_humanize_error(
+                technical, prompt=prompt,
+                context="generating an AI observation about the statistical results",
+            ),
             dataframe=df,
             sql=sql,
         )
