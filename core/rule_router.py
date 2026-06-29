@@ -144,6 +144,26 @@ _SQL_ANSWER_PATTERNS = [
 
     # Comparison (simple, not statistical)
     r"\bcompare\s+.{0,50}\b(vs\.?|versus|against|and)\b",
+    # "percentage/proportion/fraction/share of X (that are/were/have) Y" —
+    # this is a COUNT(*) FILTER (...) / COUNT(*) ratio, a single SELECT with
+    # no GROUP BY or window function needed. These words sound statistical
+    # in isolation, but the underlying SQL is exactly as simple as a plain
+    # COUNT — without this pattern the question zero-matches the rule layer
+    # entirely and gets cold-routed to the LLM, which strongly over-
+    # associates "percentage/proportion/fraction" with the statistical
+    # route on vocabulary alone, even when no real statistics are involved.
+    r"\b(percentage|proportion|fraction|share)\s+of\s+\w+",
+    # "(what is the) range of <column>" — MIN(col) and MAX(col), two simple
+    # aggregates in one SELECT. Distinct from "how does X vary/differ" (left
+    # unmatched here on purpose — that phrasing is genuinely ambiguous
+    # between "give me the min/max" and "give me the standard deviation",
+    # and is better resolved by the LLM with full context than forced here).
+    # Negative lookbehind excludes "interquartile range" — that specific
+    # phrase is unambiguously statistical (IQR) and is already matched by
+    # _STATISTICAL_PATTERNS; without this exclusion it would double-match
+    # both routes and create a false ambiguity for a query that should
+    # cleanly resolve to statistical.
+    r"(?<!interquartile )\brange\s+of\s+\w+",
 ]
 
 # ── Route C: Metadata (pure structural enumeration, NO conditions) ────────────

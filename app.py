@@ -3,10 +3,6 @@ from pathlib import Path
 import socket
 
 # ── FIX: Force Python to use IPv4 so 'localhost' doesn't crash on Windows ──
-# NOTE: this patches socket.getaddrinfo process-wide for the lifetime of the
-# app — it affects every network call this process makes, not just Ollama.
-# Fine for this app's single purpose (local Ollama + Streamlit), but if a
-# future feature needs real IPv6 resolution, this patch will silently block it.
 old_getaddrinfo = socket.getaddrinfo
 def new_getaddrinfo(*args, **kwargs):
     responses = old_getaddrinfo(*args, **kwargs)
@@ -114,20 +110,86 @@ def _remove_file(filename: str):
 
 def _to_friendly_dict(plain_english_msg: str, prompt: str = "") -> dict:
     """
-    Wrap a plain-English error string (already humanized by _humanize_error
-    in sql_engine / route_d) into the friendly_error dict structure that
-    _render_assistant_message expects.
+    Wrap a plain-English error into the friendly_error dict.
 
-    This avoids a second LLM call for routes that already produce plain-English
-    errors — only Route A and raw validator errors need the full LLM treatment.
+    Generates contextual suggestion and rephrasing text by pattern-matching
+    the already-humanized message — no extra LLM call needed.
+    This is intentionally cheap: the humanization already happened in
+    _humanize_error(). This function just formats the display fields.
     """
+    msg_lower = plain_english_msg.lower()
+
+    # ── Column not found ──────────────────────────────────────────────────────
+    if "column" in msg_lower and any(
+        w in msg_lower for w in ("doesn't have", "don't have", "does not exist", "not found")
+    ):
+        col_match = re.search(r'"([^"]+)"', plain_english_msg)
+        bad_col   = col_match.group(1) if col_match else "that column"
+        return {
+            "explanation": plain_english_msg,
+            "suggestion": (
+                f'"{bad_col}" is not a column in your dataset — '
+                f"the column name may be different from what you mentioned."
+            ),
+            "rephrasing": (
+                "Open the schema panel → find the correct column name → "
+                f"then try: \"{prompt.replace(bad_col, '<correct column name>')}\"."
+                if prompt and col_match else
+                "Open the schema panel on the left and use one of the exact "
+                "column names shown there in your question."
+            ),
+        }
+
+    # ── Math on text column ───────────────────────────────────────────────────
+    if "text instead of numbers" in msg_lower or (
+        "calculation" in msg_lower and "text" in msg_lower
+    ):
+        return {
+            "explanation": plain_english_msg,
+            "suggestion": (
+                "You may be trying to calculate something (total, average, sum) "
+                "on a column that stores names or categories, not numbers."
+            ),
+            "rephrasing": (
+                "Check the schema panel for columns with a BIGINT or DOUBLE type — "
+                "those are the numeric ones. Then ask: "
+                "\"What is the total [numeric column] grouped by [category column]?\""
+            ),
+        }
+
+    # ── Session / table not found ─────────────────────────────────────────────
+    if "session" in msg_lower and "expired" in msg_lower:
+        return {
+            "explanation": plain_english_msg,
+            "suggestion":  "Your session may have timed out while you were away.",
+            "rephrasing":  "Re-upload your file using the sidebar, then ask again.",
+        }
+
+    # ── Ambiguous column ──────────────────────────────────────────────────────
+    if "more than one table" in msg_lower or "appears in" in msg_lower:
+        return {
+            "explanation": plain_english_msg,
+            "suggestion":  "Try naming the table in your question to be more specific.",
+            "rephrasing": (
+                f"Try: \"From the [table name], {prompt.lower()}\""
+                if prompt else
+                "Specify which table you mean alongside the column name."
+            ),
+        }
+
+    # ── Generic / unknown ─────────────────────────────────────────────────────
     return {
         "explanation": plain_english_msg,
-        "suggestion":  "Try rephrasing your question more specifically.",
-        "rephrasing":  (
-            f"Try asking: '{prompt}' using exact column names shown in the schema."
+        "suggestion": (
+            "Try rephrasing your question using the exact column names "
+            "shown in the schema panel."
+        ),
+        "rephrasing": (
+            f"Try asking: \"{prompt}\" but replace any column names with "
+            "the exact names shown in the schema panel."
             if prompt else
-            "Use the schema view to check exact column names, then rephrase."
+            "Check the schema panel for the available column names and "
+            "rephrase your question around those."
         ),
     }
 
@@ -313,7 +375,7 @@ def _render_assistant_message(msg: dict):
                 with st.expander(f"Table: `{t_data['name']}`", expanded=True):
                     st.code(t_data["ddl"], language="sql")
                     if t_data.get("info_df") is not None:
-                        st.dataframe(t_data["info_df"], width="stretch")
+                        st.dataframe(t_data["info_df"], use_container_width=True)
         if msg.get("answer"):
             st.markdown(msg["answer"])
         if msg.get("df") is not None:
@@ -354,7 +416,7 @@ def _render_assistant_message(msg: dict):
         with st.expander("🔎 Generated SQL", expanded=False):
             st.code(msg["sql"], language="sql")
         st.subheader(f"📊 {msg['intent'].get('title', 'Visualization')}")
-        st.plotly_chart(msg["fig"], width="stretch")
+        st.plotly_chart(msg["fig"], use_container_width=True)
         col_csv, col_html = st.columns(2)
         with col_csv:
             st.download_button(
@@ -373,7 +435,7 @@ def _render_assistant_message(msg: dict):
                 key=f"dl_html_{msg['id']}",
             )
         with st.expander("📋 Raw query result", expanded=False):
-            st.dataframe(msg["df"].head(50), width="stretch")
+            st.dataframe(msg["df"].head(50), use_container_width=True)
 
     else:  # sql_answer
         if msg.get("sql"):
@@ -433,7 +495,7 @@ with st.sidebar:
                 st.markdown(f"**`{t}`**")
                 st.dataframe(
                     st.session_state.duckdb_conn.execute(f"SELECT * FROM {t} LIMIT 5").df(),
-                    width="stretch",
+                    use_container_width=True,
                 )
         st.divider()
         if st.button("🗑️ Delete Session", type="secondary", use_container_width=True):
@@ -568,7 +630,6 @@ else:
                     if not assistant_msg.get("error") and route_label == "metadata":
                         route_c_result = run_route_c(conn=conn, tables=tables, prompt=prompt)
                         if not route_c_result.success:
-                            # Route C errors are plain English already
                             assistant_msg["error"] = route_c_result.error or "Could not retrieve metadata."
                             assistant_msg["_error_pre_humanized"] = True
                         else:
@@ -585,15 +646,9 @@ else:
                             router_intent=parsed_route,
                         )
                         if not route_a_result.success:
-                            # Route A errors are already user-friendly plain-English
-                            # strings (raised as ValueError in _extract_intent /
-                            # _build_chart). Use _explain_error_with_llm for the
-                            # richer "what you might have meant / try rephrasing"
-                            # treatment since route_a doesn't call _humanize_error.
                             assistant_msg["error"]   = route_a_result.error or "Visualization failed."
                             assistant_msg["val_log"] = route_a_result.validation_log
                             assistant_msg["sql"]     = route_a_result.sql
-                            # friendly_error will be filled by _stamp_friendly_error below
                         else:
                             assistant_msg.update({
                                 "intent":  route_a_result.intent,
@@ -610,7 +665,6 @@ else:
                             route_label=route_label,
                         )
                         if not route_d_result.success:
-                            # Route D errors are already humanized by _humanize_error
                             assistant_msg["error"] = route_d_result.error or "Statistical analysis failed."
                             assistant_msg["sql"]   = route_d_result.sql
                             assistant_msg["_error_pre_humanized"] = True
@@ -630,7 +684,6 @@ else:
                             db_session=conn,
                         )
                         if not sql_result["success"]:
-                            # Route B errors already humanized by _humanize_error
                             assistant_msg["error"] = sql_result["error"]
                             assistant_msg["sql"]   = sql_result.get("sql")
                             assistant_msg["_error_pre_humanized"] = True
@@ -638,8 +691,6 @@ else:
                             sql = sql_result["sql"]
                             ok, reason = validate_sql_query(conn, sql, tables)
                             if not ok:
-                                # validator.py returns raw technical strings —
-                                # humanize before storing
                                 assistant_msg["error"] = _humanize_error(
                                     reason, prompt=prompt,
                                     context="validating the generated query before running it",
@@ -660,8 +711,6 @@ else:
                                     assistant_msg["_error_pre_humanized"] = True
 
                     # ── Attach friendly_error for any remaining error ──────────
-                    # _stamp_friendly_error checks _error_pre_humanized to decide
-                    # whether to call the LLM or just wrap the existing message.
                     _stamp_friendly_error(assistant_msg, ddl_schema=ddl_for_router)
 
                 _render_assistant_message(assistant_msg)

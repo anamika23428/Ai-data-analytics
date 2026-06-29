@@ -27,9 +27,21 @@
 #      fails to break this habit across all 3 repair attempts.
 #  11. _humanize_error: converts raw technical error strings into plain-English
 #      user-facing messages using llama3.2:3b (already warm from the routing
-#      step). Falls back to a cleaned raw message if the LLM call fails.
-#      Ollama connectivity errors are handled without an LLM call since you
-#      cannot call Ollama to explain that Ollama is unreachable.
+#      step). Falls back to a pattern-based plain-English classifier (NOT the
+#      broken regex) when the LLM call fails — raw technical text is NEVER
+#      shown to the user regardless of whether the LLM is available.
+#
+#      FIX vs previous version:
+#      The old fallback `re.sub(r"^[\w.]+Error:\s*", "", technical_msg)` did
+#      nothing when the error string did not start with a bare "SomeError:"
+#      prefix. validator.py prepends "Generated SQL could not be parsed or
+#      validated by DuckDB: Binder Error: ..." which starts with "Generated",
+#      so the regex matched nothing and the full raw DuckDB error leaked
+#      through verbatim — exactly what the screenshot showed.
+#      Replaced with a pattern-based classifier that recognises common DuckDB
+#      error shapes (column not found, type mismatch, syntax error, etc.) and
+#      returns a plain-English sentence for each, even when the LLM is down.
+#
 #  12. _fix_unnest_with_aggregation: rewrites the model's common mistake of
 #      mixing UNNEST(STRING_SPLIT(...)) and aggregate functions (AVG/SUM/COUNT/
 #      MIN/MAX) at the same SELECT level, which DuckDB rejects. Restructures
@@ -175,7 +187,7 @@ Write a corrected DuckDB SQL query that fixes this error exactly.
 Output ONLY the raw SQL, nothing else.
 """
 
-# ── LLM-based error humanization ──────────────────────────────────────────────
+# ── LLM-based error humanization ─────────────────────────────────────────────
 _ERROR_HUMANIZER_SYSTEM = """\
 You are a helpful data assistant that explains technical errors to non-technical users.
 
@@ -216,21 +228,28 @@ def _humanize_error(
     Convert a raw technical error string into a plain-English user-facing
     message using llama3.2:3b (ROUTER_MODEL).
 
-    Falls back gracefully when:
-    - Ollama itself is unreachable (hardcoded message — can't call Ollama
-      to explain that Ollama is down)
-    - The humanization LLM call fails or times out for any reason
-    - The LLM returns an empty response
+    Three-level cascade:
+      1. Ollama connectivity errors → hardcoded message (no HTTP call).
+      2. llama3.2:3b LLM call → returns plain-English sentence on success.
+      3. Pattern-based classifier → recognises common DuckDB error shapes
+         and returns a genuinely plain-English sentence. Raw technical text
+         is NEVER shown regardless of whether the LLM is available.
 
-    Raw technical detail is always logged at DEBUG level for terminal debugging.
+    NOTE on the old approach:
+      The previous fallback used `re.sub(r"^[\w.]+Error:\\s*", "", msg)` which
+      only stripped a leading "SomethingError:" class-name prefix. When
+      validator.py prepends "Generated SQL could not be parsed or validated
+      by DuckDB: Binder Error: ..." the string starts with "Generated", the
+      regex matches nothing, and the full raw DuckDB text leaked through.
+      That is why the screenshot showed raw DuckDB error text in the UI.
+      This version never falls back to raw technical text under any condition.
     """
-    logger.debug("Raw technical error (before humanization): %s", technical_msg)
+    logger.debug("Raw error (before humanization): %s", technical_msg)
 
-    # ── Special case: Ollama connectivity errors ───────────────────────────────
+    # ── Guard: Ollama connectivity — never call Ollama to explain this ────────
     if re.search(
         r"Cannot connect|Connection refused|ConnectionError|Failed to establish",
-        technical_msg,
-        re.IGNORECASE,
+        technical_msg, re.IGNORECASE,
     ):
         return (
             "The system couldn't reach the local AI model server. "
@@ -240,9 +259,9 @@ def _humanize_error(
     # ── LLM-based humanization ────────────────────────────────────────────────
     try:
         user_payload = _ERROR_HUMANIZER_USER.format(
-            prompt=prompt or "not specified",
-            context=context,
-            error=technical_msg,
+            prompt  = prompt  or "not specified",
+            context = context,
+            error   = technical_msg,
         )
         payload = {
             "model":    ROUTER_MODEL,
@@ -269,16 +288,95 @@ def _humanize_error(
                 return explanation
 
         logger.debug(
-            "Error humanization LLM returned status %d — falling back to raw message.",
+            "Humanization LLM returned HTTP %d — falling back to classifier.",
             resp.status_code,
         )
 
     except Exception as humanize_exc:
-        logger.debug("Error humanization LLM call failed: %s", humanize_exc)
+        # Never let error humanization itself crash the app.
+        logger.debug("Humanization LLM call failed: %s", humanize_exc)
 
-    # ── Fallback: clean up the raw message ────────────────────────────────────
-    cleaned = re.sub(r"^[\w.]+Error:\s*", "", technical_msg).strip()
-    return cleaned or "An unexpected error occurred. Please try again."
+    # ── Fallback: pattern-based plain-English classifier ──────────────────────
+    # The LLM call failed or returned empty. NEVER show raw technical text.
+    # Recognise common DuckDB error shapes and return a plain-English message
+    # for each. The old regex approach (re.sub r"^[\w.]+Error:\s*") was
+    # silently broken — it matched nothing when the string started with
+    # "Generated SQL could not be parsed..." — so this replaces it entirely.
+
+    # Pattern 1: Column does not exist in dataset
+    col_match = re.search(
+        r'[Rr]eferenced column\s+["\']?([\w\s]+?)["\']?\s+not found',
+        technical_msg, re.IGNORECASE,
+    )
+    if col_match:
+        bad_col = col_match.group(1).strip()
+        return (
+            f'Your dataset doesn\'t have a column called "{bad_col}". '
+            f"Open the schema panel on the left to see the exact column "
+            f"names available, then rephrase your question using one of those."
+        )
+
+    # Pattern 2: Ambiguous column — exists in more than one table
+    if re.search(r"ambiguous (column|reference|binding)", technical_msg, re.IGNORECASE):
+        return (
+            "Your question refers to a column name that appears in more than "
+            "one table in your dataset. Try being more specific by mentioning "
+            "which table you mean alongside the column name."
+        )
+
+    # Pattern 3: Type mismatch — trying to do math on a text column
+    if (
+        re.search(
+            r"(cannot|could not|unable to)\s+(cast|convert)",
+            technical_msg, re.IGNORECASE,
+        )
+        or "no function matches" in technical_msg.lower()
+        or "conversion error" in technical_msg.lower()
+    ):
+        return (
+            "The system tried to do a calculation on a column that holds "
+            "text instead of numbers. Check the schema panel to see which "
+            "columns are numeric, then rephrase your question to use one of those."
+        )
+
+    # Pattern 4: General binder / parser error (covers most other DuckDB errors)
+    if re.search(
+        r"binder error|parser error|syntax error|catalog error",
+        technical_msg, re.IGNORECASE,
+    ):
+        return (
+            "The system had difficulty understanding how to search your data "
+            "for that question. Try rephrasing it more simply, or check the "
+            "schema panel to confirm the column names you're asking about."
+        )
+
+    # Pattern 5: Table or relation not found
+    if re.search(
+        r"(table|relation|catalog entry)\s+.+?\s+(not found|does not exist)",
+        technical_msg, re.IGNORECASE,
+    ):
+        return (
+            "The system couldn't find the data table it was looking for. "
+            "This usually means the session has expired — try re-uploading "
+            "your file and asking again."
+        )
+
+    # Pattern 6: Division by zero
+    if re.search(r"division by zero|divide by zero", technical_msg, re.IGNORECASE):
+        return (
+            "The calculation in your question resulted in a division by zero, "
+            "which usually means some rows in your data have a zero or empty "
+            "value in the column being used as a divisor. Try filtering those "
+            "rows out or asking a different question."
+        )
+
+    # Catch-all: completely unknown error shape — generic but never shows raw text
+    return (
+        "The system wasn't able to produce a result for that question. "
+        "This usually happens when the question refers to a column or "
+        "calculation that doesn't match your dataset. Check the schema "
+        "panel on the left for the exact column names and try rephrasing."
+    )
 
 
 # ── Delimiter detection ────────────────────────────────────────────────────────
@@ -481,25 +579,19 @@ def _fix_unnest_in_where(sql: str) -> str:
     return sql
 
 
-# Matches the flat (broken) pattern:
-#   SELECT [DISTINCT] UNNEST(STRING_SPLIT(col, 'X')) AS cat_alias,
-#          AGG(agg_col) AS agg_alias
-#   FROM table
-#   [GROUP BY ...]
-# Captures all named parts so the rewrite can use them exactly.
 _UNNEST_WITH_AGG_PATTERN = re.compile(
     r"SELECT\s+(?:DISTINCT\s+)?"
     r"UNNEST\s*\(\s*STRING_SPLIT\s*\(\s*"
-    r"([^\s,]+)"               # group 1: column expression (e.g. category or "category")
+    r"([^\s,]+)"
     r"\s*,\s*"
-    r"('[^']*'|\"[^\"]*\")"    # group 2: delimiter literal (e.g. '|')
+    r"('[^']*'|\"[^\"]*\")"
     r"\s*\)\s*\)"
-    r"\s+AS\s+(\w+)"           # group 3: cat alias (e.g. cat)
+    r"\s+AS\s+(\w+)"
     r"\s*,\s*"
-    r"(AVG|SUM|COUNT|MIN|MAX)" # group 4: aggregate function
-    r"\s*\(([^)]+)\)"          # group 5: aggregate column expression
-    r"\s+AS\s+(\w+)"           # group 6: aggregate alias
-    r"\s+FROM\s+(\w+)"         # group 7: table name
+    r"(AVG|SUM|COUNT|MIN|MAX)"
+    r"\s*\(([^)]+)\)"
+    r"\s+AS\s+(\w+)"
+    r"\s+FROM\s+(\w+)"
     r"(?:\s+(?:WHERE|GROUP\s+BY|ORDER\s+BY|LIMIT)[^;]*)?",
     re.IGNORECASE,
 )
@@ -513,26 +605,6 @@ def _fix_unnest_with_aggregation(sql: str) -> str:
     DuckDB requires the UNNEST to be in an inner subquery that expands rows
     first, with the aggregation happening in the outer query over those
     expanded rows.
-
-    Example — WRONG (what the model generates):
-      SELECT DISTINCT UNNEST(STRING_SPLIT(category, '|')) AS cat,
-             AVG(TRY_CAST(discount_percentage AS DOUBLE)) AS avg_discount
-      FROM amazon
-      GROUP BY cat;
-
-    Example — CORRECT (what this rewrites it to):
-      SELECT cat, AVG(TRY_CAST(discount_percentage AS DOUBLE)) AS avg_discount
-      FROM (
-        SELECT UNNEST(STRING_SPLIT(category, '|')) AS cat,
-               TRY_CAST(discount_percentage AS DOUBLE) AS discount_percentage
-        FROM amazon
-      ) sub
-      WHERE cat IS NOT NULL AND TRIM(cat) <> ''
-      GROUP BY cat
-      ORDER BY avg_discount DESC;
-
-    This fires before _fix_unnest_in_where and _harden_casts so the other
-    fixers run on the already-restructured query.
     """
     match = _UNNEST_WITH_AGG_PATTERN.search(sql)
     if not match:
@@ -569,12 +641,9 @@ def _harden_sql(sql: str) -> str:
     Apply all deterministic post-generation safety rewrites in order.
     Order matters:
       1. _fix_unnest_with_aggregation — restructures the whole query first
-      2. _fix_decimal_stripping       — then fix decimal-stripping inside expressions
-      3. _fix_unnest_in_where         — then fix any WHERE-clause UNNEST misuse
-      4. _harden_casts                — finally upgrade bare CAST → TRY_CAST
-
-    Logs a before/after when any rewrite actually fires so it's visible in
-    the terminal whether the model needed correction or wrote correct SQL.
+      2. _fix_decimal_stripping       — fix decimal-stripping inside expressions
+      3. _fix_unnest_in_where         — fix any WHERE-clause UNNEST misuse
+      4. _harden_casts                — upgrade bare CAST → TRY_CAST
     """
     before = sql
     sql = _fix_unnest_with_aggregation(sql)
@@ -634,9 +703,8 @@ def generate_safe_sql(
         {"success": True,  "sql": "<query>"}
         {"success": False, "error": "<plain-English user-facing message>"}
 
-    All error messages in the "error" key are plain English generated by
-    llama3.2:3b, suitable for display directly in the UI without modification.
-    Raw technical detail is logged at DEBUG/WARNING level for terminal debugging.
+    All "error" values are plain-English strings from _humanize_error().
+    Raw technical text is never returned in the error field.
     """
     conn       = db_session
     all_tables = [t.strip() for t in table_name.split(",") if t.strip()] if table_name else []

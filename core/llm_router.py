@@ -123,6 +123,41 @@ and anything else, choose sql_answer.
   analytical.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+VOCABULARY TRAP — words that SOUND statistical but usually aren't:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+The words below are NOT, by themselves, evidence for "statistical". Judge
+each question by what SQL it actually requires, not by whether it sounds
+analytical:
+
+- "percentage", "proportion", "fraction", "share" — "what percentage of
+  orders were cancelled" is a single COUNT(*) FILTER(...) / COUNT(*) ratio.
+  This is "sql_answer", not "statistical", every time. There is no
+  percentile, z-score, or distribution math here — just a ratio of two counts.
+
+- "range" — "what is the range of prices" means MIN(price) and MAX(price),
+  two simple aggregates in one SELECT. This is "sql_answer". (Exception:
+  "interquartile range" or "IQR" IS statistical — that's a specific named
+  statistical measure, not the everyday word "range".)
+
+- "vary" / "differ" / "spread" / "distribution" used loosely — these CAN
+  go either way and require judgment:
+  - If the question can be answered by simply listing or grouping values
+    (e.g. "how do prices differ between categories" → just GROUP BY
+    category, show MIN/MAX/AVG per group) → "sql_answer".
+  - If the question explicitly asks for a measure of variability itself —
+    standard deviation, variance, spread as a single number, or "how much
+    do values typically deviate" — → "statistical".
+  - When genuinely unsure, prefer "sql_answer": a GROUP BY breakdown is
+    usually what the user actually wants, and is always a safe, useful
+    answer even if they would have also accepted a stddev number.
+
+Do not let a single statistically-flavored WORD override what the
+underlying SQL actually needs. Ask yourself: "could I answer this with one
+SELECT plus an optional GROUP BY, ORDER BY, or LIMIT?" If yes, it is
+"sql_answer" regardless of how analytical the phrasing sounds.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ROUTE DEFINITIONS — choose the single best fit:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -153,6 +188,8 @@ Examples (retrieval):
   "who placed order #1042"
   "give me all completed sessions"
   "what is the email of customer 101"
+  "Did a user named 'Manish' write any reviews? Show me the review titles if he did."  ← sql_answer, NOT metadata
+  "Show me the product names and actual prices for anything with a discount percentage of more than 80%."  ← sql_answer, NOT visualization
 Examples (simple aggregation):
   "what is the total revenue"
   "average rating by category"
@@ -169,6 +206,10 @@ Examples (simple aggregation):
   "list the top 10 selling products"        ← sql_answer, NOT metadata
   "show the 5 highest-rated items"          ← sql_answer, NOT statistical
   "what are the best-selling categories"    ← sql_answer, NOT metadata
+  "what percentage of orders were cancelled"            ← sql_answer, NOT statistical (a COUNT ratio)
+  "what is the proportion of orders from each region"   ← sql_answer, NOT statistical
+  "what fraction of products are out of stock"          ← sql_answer, NOT statistical
+  "what is the range of prices in each category"        ← sql_answer, NOT statistical (just MIN/MAX)
 
 "metadata"
 → User wants to explore what EXISTS in the data — unique values, distinct
@@ -285,7 +326,35 @@ CRITICAL ROUTING RULES — NEVER VIOLATE THESE:
     covers unconditional structural enumeration) and never "statistical"
     (which requires a calculation beyond a single aggregation).
 
-11. Output ONLY the JSON object. No markdown, no backticks, no text outside JSON.
+11. "Did a/the/any <person or entity> [named/called X] do/write/place/have
+    <something>? Show me <related field> if [so/he/she/they] did" — this is
+    a WHERE-filtered existence + retrieval question about a SPECIFIC named
+    row (e.g. "Did a user named 'Manish' write any reviews? Show me the
+    review titles if he did."). This is ALWAYS "sql_answer", never
+    "metadata" — metadata existence checks are about whether a COLUMN or
+    CATEGORY exists in the schema, never about whether a specific named
+    person's rows exist in the data.
+
+12. "Show me the <column A> [and <column B>] for <items/products/rows/
+    customers/orders> with/that/where/having <a numeric or categorical
+    condition>" — this is a multi-column WHERE-filtered SELECT (e.g. "Show
+    me the product names and actual prices for anything with a discount
+    percentage of more than 80%."). This is ALWAYS "sql_answer", NEVER
+    "visualization" — "show me X and Y" only means "visualization" when a
+    chart/graph/plot/visualize word is ALSO present, or the user is asking
+    to see a trend/distribution/comparison shape. Listing specific field
+    values for filtered rows is retrieval, not a chart request, even when
+    two or more columns are named.
+
+13. "what percentage/proportion/fraction/share of X (are/were/have) Y" is
+    a single COUNT ratio — ALWAYS "sql_answer", NEVER "statistical". "what
+    is the range of <column>" is just MIN and MAX — ALWAYS "sql_answer",
+    NEVER "statistical" (unless the phrase is specifically "interquartile
+    range" or "IQR", which IS statistical). See VOCABULARY TRAP above —
+    do not classify a question as "statistical" just because it contains a
+    word that sounds analytical; check what SQL it actually requires.
+
+14. Output ONLY the JSON object. No markdown, no backticks, no text outside JSON.
 """
 
 
@@ -406,6 +475,25 @@ def route_query(
             f"Choose the single best route from that shortlist unless neither "
             f"fits — in that case choose whichever route is correct.\n"
         )
+    else:
+        # Zero rule matches: the keyword scan found NO obvious signal for any
+        # route. This does NOT mean the question is ambiguous or unanswerable
+        # — it usually means the question is phrased in a way the keyword
+        # patterns didn't anticipate. Most zero-match questions turn out to
+        # be ordinary row/aggregate retrieval (sql_answer), so bias toward it
+        # — but only when there's truly no visualization, metadata, or
+        # statistical signal either. This keeps "plot it" routable as
+        # visualization and "what insights can you give me" routable as
+        # statistical, instead of forcing every zero-match case into
+        # sql_answer regardless of actual content.
+        candidate_hint = (
+            f"\nA preliminary rule scan found no obvious keyword match for this "
+            f"question. In the absence of a clear chart/plot/visualize request, "
+            f"a clear schema/structure question, or a clear complex-math/"
+            f"narrative-insight request, default to \"sql_answer\" — most "
+            f"unmatched questions are ordinary row or aggregate retrieval "
+            f"phrased in a way the keyword scan didn't anticipate.\n"
+        )
 
     sample_section = ""
     if sample_rows:
@@ -437,20 +525,19 @@ def route_query(
         raw_text     = raw_response["message"]["content"]
         parsed       = _parse_json_safe(raw_text)
 
-        parsed["confidence"] = str(parsed.get("confidence", "")).upper()
+        parsed["confidence"] = str(parsed.get("confidence", "MEDIUM")).upper()
         if parsed["confidence"] not in ("HIGH", "MEDIUM", "LOW"):
-            raise ValueError(
-                f"Router returned an unrecognised confidence level: '{parsed.get('confidence')}'. "
-                "Expected HIGH, MEDIUM, or LOW."
-            )
+            parsed["confidence"] = "MEDIUM"
 
         # Validate route label — reject hallucinated labels
         valid_routes = {"visualization", "sql_answer", "metadata", "statistical"}
         if parsed.get("route") not in valid_routes:
-            raise ValueError(
-                f"Router returned an unrecognised route: '{parsed.get('route')}'. "
-                f"Valid routes are: {', '.join(sorted(valid_routes))}."
+            logger.warning(
+                "LLM returned invalid route '%s' — falling back to sql_answer",
+                parsed.get("route"),
             )
+            parsed["route"]      = "sql_answer"
+            parsed["confidence"] = "LOW"
 
         result = {
             "success":      True,
