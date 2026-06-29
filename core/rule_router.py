@@ -95,6 +95,24 @@ _SQL_ANSWER_PATTERNS = [
     r"\bwhich\s+(specific\s+)?(person|employee|customer|user|product|order|item|record)s?\b",
     r"\bwhat\s+(is|are)\s+the\s+(email|name|id|address|status|phone|number|code|description)\b",
     r"\btell\s+me\s+about\s+(the\s+)?(specific|individual|particular)\b",
+    # "Did a/the/any <noun> [named/called X] <verb> any <noun2>" — a named-
+    # entity existence + retrieval question, e.g. "Did a user named 'Manish'
+    # write any reviews? Show me the review titles if he did." This is a
+    # WHERE name = 'X' filter, not a structural metadata existence check
+    # (those ask whether a COLUMN exists, not whether a specific person's
+    # ROWS exist) — without this pattern the whole question fell through
+    # with zero candidates and was cold-routed to the LLM, which tends to
+    # mistake the "did...any" existence phrasing for a metadata check.
+    r"\bdid\s+(a|the|any)\s+\w+(\s+(named|called)\s+[\"']?[\w\s]+?[\"']?)?\s+\w+\s+any\b",
+    # "show me the X [and Y] for anything/items/products/rows/entries with/
+    # that/where/having <condition>" — a multi-column filtered retrieval,
+    # e.g. "Show me the product names and actual prices for anything with a
+    # discount percentage of more than 80%." The leading "show me the X and
+    # Y" superficially resembles a visualization request ("show me X and Y"
+    # plotted together), but the trailing "for <noun> with/that <condition>"
+    # makes this a WHERE-filtered SELECT of multiple columns, not a chart —
+    # there is no chart/graph/plot/visualize keyword anywhere in the prompt.
+    r"\bshow\s+(me\s+)?(the\s+)?[\w\s,]+?\s+for\s+(anything|items?|products?|rows?|records?|entries|orders?|customers?|users?)\s+(with|that|where|having)\b",
 
     # ── Simple aggregations (Route B, NOT Route D) ────────────────────────────
     # Single-value aggregations
@@ -129,8 +147,6 @@ _SQL_ANSWER_PATTERNS = [
 ]
 
 # ── Route C: Metadata (pure structural enumeration, NO conditions) ────────────
-# A master negative lookahead that aborts the Route C match if ANY filtering, 
-# threshold, or conditional word appears later in the user's prompt.
 # A master negative lookahead that aborts the Route C match if ANY filtering,
 # threshold, or conditional word appears later in the user's prompt.
 # NOTE: "order" alone is intentionally excluded from the word list — it's a
