@@ -30,6 +30,10 @@
 #      step). Falls back to a cleaned raw message if the LLM call fails.
 #      Ollama connectivity errors are handled without an LLM call since you
 #      cannot call Ollama to explain that Ollama is unreachable.
+#  12. _fix_unnest_with_aggregation: rewrites the model's common mistake of
+#      mixing UNNEST(STRING_SPLIT(...)) and aggregate functions (AVG/SUM/COUNT/
+#      MIN/MAX) at the same SELECT level, which DuckDB rejects. Restructures
+#      into the correct two-level subquery pattern automatically.
 
 import logging
 import re
@@ -102,6 +106,25 @@ There are EXACTLY TWO ways to use a delimited column. Choose based on context:
 
 NEVER use UNNEST inside a WHERE clause. DuckDB does not support it there.
 
+AGGREGATION OVER DELIMITED COLUMNS — THIS IS CRITICAL:
+When you need BOTH UNNEST (to expand segments) AND an aggregate like AVG/SUM/COUNT,
+you MUST use a two-level subquery — NEVER put UNNEST and an aggregate in the same
+SELECT level, as DuckDB does not support this.
+
+WRONG (flat — DuckDB rejects this):
+  SELECT UNNEST(STRING_SPLIT(category, '|')) AS cat, AVG(price) AS avg_price
+  FROM t GROUP BY cat;
+
+CORRECT (subquery — always use this pattern):
+  SELECT cat, AVG(price) AS avg_price
+  FROM (
+    SELECT UNNEST(STRING_SPLIT(category, '|')) AS cat, price
+    FROM t
+  ) sub
+  WHERE cat IS NOT NULL AND TRIM(cat) <> ''
+  GROUP BY cat
+  ORDER BY avg_price DESC;
+
 DUCKDB-SPECIFIC RULES:
 - When using SUM/AVG/COUNT/MIN/MAX, always include the matching GROUP BY clause.
 - If you use math operators (<, >, =) on a text/VARCHAR column, you MUST ALWAYS wrap the column in TRY_CAST(... AS DOUBLE) first. Never compare a string directly to an integer.
@@ -134,6 +157,14 @@ REPAIR INSTRUCTIONS:
   WRONG: WHERE list_contains(UNNEST(STRING_SPLIT(col, '|')), 'value')
   RIGHT: WHERE list_contains(STRING_SPLIT(col, '|'), 'value')
 
+- If the error mentions UNNEST with an aggregate function (AVG, SUM, COUNT, MIN, MAX):
+  You cannot use UNNEST and aggregate functions at the same SELECT level.
+  Use a subquery to expand first, then aggregate:
+  WRONG: SELECT UNNEST(STRING_SPLIT(col, '|')) AS cat, AVG(price) AS avg FROM t GROUP BY cat;
+  RIGHT: SELECT cat, AVG(price) AS avg FROM (
+           SELECT UNNEST(STRING_SPLIT(col, '|')) AS cat, price FROM t
+         ) sub WHERE cat IS NOT NULL GROUP BY cat ORDER BY avg DESC;
+
 - If the error says "Referenced column not found" and provides "Candidate bindings":
   Replace your hallucinated column name with one of the exact Candidate bindings
   provided in the error message.
@@ -145,11 +176,6 @@ Output ONLY the raw SQL, nothing else.
 """
 
 # ── LLM-based error humanization ──────────────────────────────────────────────
-# Uses llama3.2:3b (ROUTER_MODEL) — a general-purpose chat model that is
-# already warm in memory from the routing step, making it ideal for this task.
-# qwen2.5-coder is deliberately NOT used here since it is a code-specialized
-# model optimized for SQL output, not plain-English explanation.
-
 _ERROR_HUMANIZER_SYSTEM = """\
 You are a helpful data assistant that explains technical errors to non-technical users.
 
@@ -190,25 +216,17 @@ def _humanize_error(
     Convert a raw technical error string into a plain-English user-facing
     message using llama3.2:3b (ROUTER_MODEL).
 
-    llama3.2:3b is chosen because:
-    - It is already loaded in memory from the routing step (no cold-start cost)
-    - It is a general-purpose chat model suited for natural-language explanation
-    - It is fast at 3B parameters, even with a short num_predict budget
-
-    Falls back gracefully (without another LLM call) when:
-    - Ollama itself is unreachable (circular — can't call Ollama to explain
-      that Ollama is down, so a hardcoded message is used instead)
+    Falls back gracefully when:
+    - Ollama itself is unreachable (hardcoded message — can't call Ollama
+      to explain that Ollama is down)
     - The humanization LLM call fails or times out for any reason
     - The LLM returns an empty response
 
-    Raw technical detail is always logged at DEBUG level for terminal debugging
-    so developers can still see the original error without it cluttering the UI.
+    Raw technical detail is always logged at DEBUG level for terminal debugging.
     """
     logger.debug("Raw technical error (before humanization): %s", technical_msg)
 
     # ── Special case: Ollama connectivity errors ───────────────────────────────
-    # If Ollama is unreachable we cannot call it to explain itself — handle
-    # this with a hardcoded message rather than attempting another LLM call.
     if re.search(
         r"Cannot connect|Connection refused|ConnectionError|Failed to establish",
         technical_msg,
@@ -227,22 +245,22 @@ def _humanize_error(
             error=technical_msg,
         )
         payload = {
-            "model":    ROUTER_MODEL,   # llama3.2:3b — warm, chat-optimized
+            "model":    ROUTER_MODEL,
             "messages": [
                 {"role": "system", "content": _ERROR_HUMANIZER_SYSTEM},
                 {"role": "user",   "content": user_payload},
             ],
             "stream":  False,
             "options": {
-                "temperature": 0.1,   # slight warmth so it sounds natural
-                "num_predict": 80,    # error messages should be short
-                "num_ctx":     512,   # small context is sufficient
+                "temperature": 0.1,
+                "num_predict": 80,
+                "num_ctx":     512,
             },
         }
         resp = requests.post(
             f"{OLLAMA_BASE_URL}/api/chat",
             json=payload,
-            timeout=15,   # short timeout — this is a fallback path, don't block long
+            timeout=15,
         )
         if resp.status_code == 200:
             explanation = resp.json()["message"]["content"].strip()
@@ -256,12 +274,9 @@ def _humanize_error(
         )
 
     except Exception as humanize_exc:
-        # Never let error humanization itself crash the app — log and fall through.
         logger.debug("Error humanization LLM call failed: %s", humanize_exc)
 
     # ── Fallback: clean up the raw message ────────────────────────────────────
-    # Strip Python exception class names from the front so the user doesn't
-    # see "BinderError:" or "requests.exceptions.ConnectionError:" prefixes.
     cleaned = re.sub(r"^[\w.]+Error:\s*", "", technical_msg).strip()
     return cleaned or "An unexpected error occurred. Please try again."
 
@@ -466,12 +481,103 @@ def _fix_unnest_in_where(sql: str) -> str:
     return sql
 
 
+# Matches the flat (broken) pattern:
+#   SELECT [DISTINCT] UNNEST(STRING_SPLIT(col, 'X')) AS cat_alias,
+#          AGG(agg_col) AS agg_alias
+#   FROM table
+#   [GROUP BY ...]
+# Captures all named parts so the rewrite can use them exactly.
+_UNNEST_WITH_AGG_PATTERN = re.compile(
+    r"SELECT\s+(?:DISTINCT\s+)?"
+    r"UNNEST\s*\(\s*STRING_SPLIT\s*\(\s*"
+    r"([^\s,]+)"               # group 1: column expression (e.g. category or "category")
+    r"\s*,\s*"
+    r"('[^']*'|\"[^\"]*\")"    # group 2: delimiter literal (e.g. '|')
+    r"\s*\)\s*\)"
+    r"\s+AS\s+(\w+)"           # group 3: cat alias (e.g. cat)
+    r"\s*,\s*"
+    r"(AVG|SUM|COUNT|MIN|MAX)" # group 4: aggregate function
+    r"\s*\(([^)]+)\)"          # group 5: aggregate column expression
+    r"\s+AS\s+(\w+)"           # group 6: aggregate alias
+    r"\s+FROM\s+(\w+)"         # group 7: table name
+    r"(?:\s+(?:WHERE|GROUP\s+BY|ORDER\s+BY|LIMIT)[^;]*)?",
+    re.IGNORECASE,
+)
+
+
+def _fix_unnest_with_aggregation(sql: str) -> str:
+    """
+    Rewrite the model's common mistake of mixing UNNEST(STRING_SPLIT(...))
+    and an aggregate function (AVG/SUM/COUNT/MIN/MAX) at the same SELECT level.
+
+    DuckDB requires the UNNEST to be in an inner subquery that expands rows
+    first, with the aggregation happening in the outer query over those
+    expanded rows.
+
+    Example — WRONG (what the model generates):
+      SELECT DISTINCT UNNEST(STRING_SPLIT(category, '|')) AS cat,
+             AVG(TRY_CAST(discount_percentage AS DOUBLE)) AS avg_discount
+      FROM amazon
+      GROUP BY cat;
+
+    Example — CORRECT (what this rewrites it to):
+      SELECT cat, AVG(TRY_CAST(discount_percentage AS DOUBLE)) AS avg_discount
+      FROM (
+        SELECT UNNEST(STRING_SPLIT(category, '|')) AS cat,
+               TRY_CAST(discount_percentage AS DOUBLE) AS discount_percentage
+        FROM amazon
+      ) sub
+      WHERE cat IS NOT NULL AND TRIM(cat) <> ''
+      GROUP BY cat
+      ORDER BY avg_discount DESC;
+
+    This fires before _fix_unnest_in_where and _harden_casts so the other
+    fixers run on the already-restructured query.
+    """
+    match = _UNNEST_WITH_AGG_PATTERN.search(sql)
+    if not match:
+        return sql
+
+    col_expr  = match.group(1).strip()
+    delim     = match.group(2).strip()
+    cat_alias = match.group(3).strip()
+    agg_func  = match.group(4).upper()
+    agg_col   = match.group(5).strip()
+    agg_alias = match.group(6).strip()
+    table     = match.group(7).strip()
+
+    rewritten = (
+        f"SELECT {cat_alias}, {agg_func}({agg_col}) AS {agg_alias} "
+        f"FROM ("
+        f"SELECT UNNEST(STRING_SPLIT({col_expr}, {delim})) AS {cat_alias}, "
+        f"{agg_col} "
+        f"FROM {table}"
+        f") sub "
+        f"WHERE {cat_alias} IS NOT NULL AND TRIM({cat_alias}) <> '' "
+        f"GROUP BY {cat_alias} "
+        f"ORDER BY {agg_alias} DESC;"
+    )
+
+    logger.info(
+        "Fixed UNNEST-with-aggregation: rewrote flat SELECT into two-level subquery."
+    )
+    return rewritten
+
+
 def _harden_sql(sql: str) -> str:
     """
-    Apply all deterministic post-generation safety rewrites.
-    Logs a before/after when any rewrite actually fires.
+    Apply all deterministic post-generation safety rewrites in order.
+    Order matters:
+      1. _fix_unnest_with_aggregation — restructures the whole query first
+      2. _fix_decimal_stripping       — then fix decimal-stripping inside expressions
+      3. _fix_unnest_in_where         — then fix any WHERE-clause UNNEST misuse
+      4. _harden_casts                — finally upgrade bare CAST → TRY_CAST
+
+    Logs a before/after when any rewrite actually fires so it's visible in
+    the terminal whether the model needed correction or wrote correct SQL.
     """
     before = sql
+    sql = _fix_unnest_with_aggregation(sql)
     sql = _fix_decimal_stripping(sql)
     sql = _fix_unnest_in_where(sql)
     sql = _harden_casts(sql)
@@ -610,8 +716,8 @@ def generate_safe_sql(
             flush=True,
         )
 
-        max_repairs     = 3
-        repair_messages = list(messages)
+        max_repairs      = 3
+        repair_messages  = list(messages)
         last_explain_err = None
 
         for attempt in range(1, max_repairs + 1):
