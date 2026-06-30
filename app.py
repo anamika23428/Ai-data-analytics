@@ -439,8 +439,10 @@ def _render_assistant_message(msg: dict):
 
     else:  # sql_answer
         if msg.get("sql"):
-            st.subheader("🔎 Generated SQL")
-            st.code(msg["sql"], language="sql")
+            # Collapsed by default — click to reveal, same pattern as the
+            # Route badge expander and every other route's SQL display.
+            with st.expander("🔎 Generated SQL", expanded=False):
+                st.code(msg["sql"], language="sql")
         if msg.get("df") is not None:
             total_rows = len(msg["df"])
             shown      = min(total_rows, 50)
