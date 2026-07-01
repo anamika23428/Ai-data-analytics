@@ -72,4 +72,4 @@ INTENT_MODEL = "llama3.2:3b"
 SQL_MODEL = "qwen2.5-coder:7b"
 
 # NEW: The analytical model used to convert SQL data into human-readable English answers
-INSIGHT_MODEL = "llama3.1:8b"
+INSIGHT_MODEL = "llama3:8b"

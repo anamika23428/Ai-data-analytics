@@ -179,6 +179,9 @@ def _validate_text_file(
     if suffix in (".csv", ".txt"):
         return _check_csv_structure(file_bytes, uploaded_file.name, suffix)
 
+    if suffix == ".json":
+        return _check_json_structure(file_bytes, uploaded_file.name)
+
     return True, ""
 
 
@@ -226,6 +229,59 @@ def _check_csv_structure(
             )
 
     return True, ""
+
+
+def _check_json_structure(file_bytes: bytes, filename: str) -> tuple[bool, str]:
+    """
+    Cheap structural sniff for .json uploads, mirroring _check_csv_structure.
+
+    We only have a partial sample (SAMPLE_SIZE bytes), so this deliberately
+    does NOT attempt a full json.loads() on the whole file — a large but
+    perfectly valid JSON file would get cut off mid-way and look "invalid"
+    for the wrong reason. Instead we just check that the content *starts*
+    like JSON or NDJSON, and give a specific, friendly message for the
+    classic mistake of renaming a CSV/TXT file to '.json'.
+    """
+    try:
+        text = file_bytes.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        try:
+            text = file_bytes.decode("latin-1", errors="strict")
+        except Exception:
+            return False, f"'{filename}' could not be decoded as text."
+
+    stripped = text.lstrip("\ufeff \t\r\n")
+    if not stripped:
+        return False, f"'{filename}' appears to be empty."
+
+    # Standard JSON document/array — real validity is confirmed at load time.
+    if stripped[0] in "{[":
+        return True, ""
+
+    # NDJSON: first line should itself be a valid JSON value.
+    first_line = stripped.splitlines()[0].strip()
+    if first_line:
+        try:
+            json.loads(first_line)
+            return True, ""
+        except json.JSONDecodeError:
+            pass
+
+    # Doesn't look like JSON at all — check for the classic mix-up of
+    # renaming a CSV/TSV file to '.json'.
+    try:
+        csv.Sniffer().sniff(stripped[:2048], delimiters=",\t;|")
+        return False, (
+            f"'{filename}' looks like a delimited (CSV-style) file, not JSON. "
+            "Rename it with a '.csv' extension, or upload real JSON starting with '{' or '['."
+        )
+    except csv.Error:
+        pass
+
+    return False, (
+        f"'{filename}' does not look like valid JSON. "
+        "JSON content should start with '{' (object) or '[' (array)."
+    )
 
 
 def _normalize_sql(sql: str) -> str:

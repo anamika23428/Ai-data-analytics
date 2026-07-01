@@ -46,7 +46,6 @@ logging.basicConfig(
 )
 
 st.set_page_config(page_title="Data Chatbot", page_icon="📊", layout="wide")
-
 cleanup_old_sessions()
 start_cleanup_daemon()
 
@@ -60,6 +59,7 @@ if "processed_files" not in st.session_state: st.session_state.processed_files =
 if "file_table_map"  not in st.session_state: st.session_state.file_table_map  = {}
 if "chat_history"    not in st.session_state: st.session_state.chat_history    = []
 if "uploader_key"    not in st.session_state: st.session_state.uploader_key    = str(uuid.uuid4())
+if "upload_errors"   not in st.session_state: st.session_state.upload_errors   = []
 
 
 def _on_uploader_change():
@@ -523,6 +523,7 @@ if run_button and uploaded_files:
         st.session_state.session_dir = session_dir
 
     conn = get_or_create_connection(st.session_state)
+    st.session_state.upload_errors = []  # clear stale errors from any previous run
 
     for uploaded_file in uploaded_files:
         if uploaded_file.name in st.session_state.processed_files:
@@ -532,7 +533,13 @@ if run_button and uploaded_files:
             ok, reason = validate_file(uploaded_file)
             if not ok:
                 status.update(label=f"❌ {uploaded_file.name} rejected", state="error")
-                st.error(reason)
+                # NOTE: st.error() here is wiped out immediately by the
+                # st.rerun() below (buttons reset on rerun, so this whole
+                # block never runs again to re-draw it). Persist the
+                # message in session_state so it survives the rerun and
+                # actually gets shown to the user — see rendering block
+                # right before "Render the Chat Interface" further down.
+                st.session_state.upload_errors.append((uploaded_file.name, reason))
                 continue
 
             file_path = save_uploaded_file(st.session_state.session_dir, uploaded_file)
@@ -541,7 +548,7 @@ if run_button and uploaded_files:
                 new_tables, warnings = load_file_into_duckdb(file_path, conn, existing)
             except Exception as e:
                 status.update(label=f"❌ Error loading {uploaded_file.name}", state="error")
-                st.error(str(e))
+                st.session_state.upload_errors.append((uploaded_file.name, str(e)))
                 continue
 
             for table_name in new_tables:
@@ -555,6 +562,16 @@ if run_button and uploaded_files:
 
     st.rerun()
 
+
+# ── Show any upload/validation errors from the last run ───────────────────────
+# These were stashed in session_state because st.rerun() (called right after
+# processing uploads) wipes out any st.error()/st.warning() that was drawn
+# during the run that triggered it — the code path that drew them doesn't
+# execute again on the rerun, so the message never reaches the user.
+if st.session_state.upload_errors:
+    for fname, reason in st.session_state.upload_errors:
+        st.error(f"**{fname}**: {reason}")
+    st.session_state.upload_errors = []
 
 # ── Render the Chat Interface ─────────────────────────────────────────────────
 if not tables:
