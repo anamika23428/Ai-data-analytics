@@ -525,6 +525,57 @@ def route_query(
         raw_text     = raw_response["message"]["content"]
         parsed       = _parse_json_safe(raw_text)
 
+        # ── Validate structure — the model sometimes answers the question
+        # directly instead of returning a routing decision. Detect this by
+        # checking for the required "route" key and retry once with a stricter
+        # prompt if it's missing. ──────────────────────────────────────────────
+        if "route" not in parsed:
+            logger.warning(
+                "LLM returned valid JSON but wrong structure (no 'route' key) — "
+                "model answered the question instead of routing it. Retrying with "
+                "stricter prompt."
+            )
+            # Inject a correction turn into the conversation
+            correction_messages = messages + [
+                {"role": "assistant", "content": raw_text},
+                {
+                    "role": "user",
+                    "content": (
+                        "That is NOT what I asked for. You answered the user's question "
+                        "directly. I need ONLY a routing decision JSON with exactly these "
+                        "keys: route, confidence, chart_type, x_axis, y_axis, aggregation, "
+                        "title, explanation. Do NOT include any data rows. Do NOT answer "
+                        "the question. Output ONLY the routing JSON, nothing else."
+                    ),
+                },
+            ]
+            try:
+                retry_response = _call_ollama_sync(correction_messages)
+                retry_text     = retry_response["message"]["content"]
+                retry_parsed   = _parse_json_safe(retry_text)
+                if "route" in retry_parsed:
+                    parsed = retry_parsed
+                    logger.info("Structure-correction retry succeeded.")
+                else:
+                    logger.warning(
+                        "Structure-correction retry also returned wrong structure — "
+                        "falling back to sql_answer."
+                    )
+                    parsed = {
+                        "route": "sql_answer", "confidence": "LOW",
+                        "chart_type": None, "x_axis": None, "y_axis": None,
+                        "aggregation": "none", "title": "",
+                        "explanation": "Router fell back after returning wrong JSON structure.",
+                    }
+            except Exception as retry_exc:
+                logger.warning("Structure-correction retry failed: %s", retry_exc)
+                parsed = {
+                    "route": "sql_answer", "confidence": "LOW",
+                    "chart_type": None, "x_axis": None, "y_axis": None,
+                    "aggregation": "none", "title": "",
+                    "explanation": "Router fell back after returning wrong JSON structure.",
+                }
+
         parsed["confidence"] = str(parsed.get("confidence", "MEDIUM")).upper()
         if parsed["confidence"] not in ("HIGH", "MEDIUM", "LOW"):
             parsed["confidence"] = "MEDIUM"

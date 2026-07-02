@@ -80,6 +80,16 @@ _SQL_ANSWER_PATTERNS = [
     # The relative clause (who/that/whose/...) is what makes this a filtered
     # retrieval — it must always win over a metadata "list unique X" read,
     # which only applies when NO condition follows.
+    # In _SQL_ANSWER_PATTERNS, update the list pattern:
+    r"\blist\s+(all\s+)?(the\s+)?(?!unique|distinct|columns|tables)\w+\s+"
+    r"(where|with|that|whose|who|above|below|working|from|in|having|earning|named|called)\b",
+    r"\blist\s+(all\s+)?employees\b",
+    r"\blist\s+(all\s+)?customers\b",
+    r"\blist\s+(all\s+)?products\b",
+    r"\blist\s+(all\s+)?orders\b",
+    r"\blist\s+(all\s+)?users\b",
+    r"\balong\s+with\s+(their|the)\b",   # "along with their job titles" → retrieval
+    r"\bworking\s+in\s+(the\s+)?\w+\s+department\b",
     r"\b(show|list|give|get|fetch)\s+(me\s+)?(the\s+)?(names?|list|details?|emails?|ids?)\s+of\s+(all\s+)?(the\s+)?(unique\s+)?\w+\s+(who|that|whose|which)\b",
     # "list/show/give [all] unique/distinct X who/that/which <condition>"
     # Same idea but without a leading "names/list/details of" — e.g.
