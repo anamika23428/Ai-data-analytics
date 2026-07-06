@@ -99,16 +99,19 @@ SQL_ANSWER keyword — the absence of a trigger word is NOT evidence for
 their own specific criteria, listed below. When in doubt between sql_answer
 and anything else, choose sql_answer.
 
-- Choose "metadata" ONLY if the question is asking what EXISTS in the
-  dataset's structure or contents in the abstract — column names, data
-  types, schema, OR an unconditional enumeration of every distinct value in
-  a column (e.g. "what are all the distinct cities"). A question asking for
-  a RANKED or LIMITED subset of actual data rows — "top N", "the highest
-  X", "the most popular Y", "the best-selling Z" — is NEVER metadata, even
-  though it contains words like "list" or "show" that also appear in
-  metadata examples. The presence of a NUMBER (top 5, top 10) or a
-  SUPERLATIVE (highest, best, most, least) describing actual data values is
-  itself positive evidence for "sql_answer", not metadata.
+- Choose "metadata" ONLY when ALL THREE hold simultaneously:
+    (1) The question asks what EXISTS in the schema or enumerates ALL
+        distinct values of a single column — column names, data types,
+        schema, or "what are all the distinct cities".
+    (2) There is NO condition, filter, ranking, limit, or comparison.
+    (3) The answer needs ZERO computation — no COUNT, no ORDER BY,
+        no aggregation of any kind.
+  If ANY of those three fails → sql_answer.
+  When in doubt between metadata and sql_answer → ALWAYS sql_answer.
+  "metadata" is the most restricted route. Only the most literal,
+  unconditional, zero-computation structural questions qualify.
+  Any question containing: most, least, top, common, frequent, popular,
+  how many, count, rank, filter, condition, or comparison → sql_answer.
 
 - Choose "statistical" ONLY if the question requires a calculation beyond
   a single SUM/AVG/COUNT/MIN/MAX/GROUP BY/ORDER BY — i.e. it needs a
@@ -212,25 +215,34 @@ Examples (simple aggregation):
   "what is the range of prices in each category"        ← sql_answer, NOT statistical (just MIN/MAX)
 
 "metadata"
-→ User wants to explore what EXISTS in the data — unique values, distinct
-  categories, column names, data types, schema structure, row counts.
-→ Use ONLY when there is NO filtering condition attached. The moment the user
-  adds "who", "where", "with", "that", "above", "below", or any condition,
-  it is NO LONGER metadata — route to sql_answer instead.
-Examples (correct metadata):
+→ Use ONLY for pure structural questions about the dataset itself.
+→ Route C has NO SQL engine and NO aggregation. It cannot filter, rank,
+  count occurrences, sort, or compare. Any question implying those goes elsewhere.
+→ THREE strict tests — ALL must pass:
+    1. Asks WHAT EXISTS in schema/structure, OR enumerates ALL distinct
+       values of ONE column with absolutely no condition attached.
+    2. NO condition, filter, ranking, limit, or comparison of any kind.
+    3. Zero computation required — pure lookup of what exists.
+→ If even ONE test fails → use sql_answer.
+Examples (CORRECT metadata):
   "what columns are in this table"
-  "list all unique cities"
-  "what are the distinct product categories"
-  "how many unique customers are there"
-  "what values exist in the status column"
-  "most common category"
   "show the schema"
   "what data types are used"
-  "how many rows in the dataset"
+  "show table structure"
+  "list all unique cities"              ← pure enumeration, no condition
+  "what are the distinct categories"    ← pure enumeration, no condition
   "what are the possible order statuses"
-Examples (NOT metadata — these have conditions, use sql_answer):
-  "list unique users who left a review"    ← sql_answer
-  "what are distinct cities with sales>100" ← sql_answer
+  "how many rows in the dataset"        ← structural row count only
+Examples (NOT metadata — sql_answer instead):
+  "most common category"               ← needs COUNT+ORDER BY → sql_answer
+  "least frequent status"              ← needs COUNT+ORDER BY → sql_answer
+  "how many unique customers are there" ← COUNT(DISTINCT) → sql_answer
+  "top 5 most popular categories"      ← ranked aggregation → sql_answer
+  "which category appears most often"  ← aggregation → sql_answer
+  "what is the most used status"       ← aggregation → sql_answer
+  "list unique users who left a review" ← has condition → sql_answer
+  "what cities have sales above 100"   ← has filter → sql_answer
+  "how many orders per city"           ← grouped aggregation → sql_answer
 
 "statistical"
 → This is a COMBINED route covering two kinds of questions — there is no
@@ -283,10 +295,15 @@ CRITICAL ROUTING RULES — NEVER VIOLATE THESE:
    "breakdown by X", "X per Y", "X by Y", "compare X vs Y"
    → ALWAYS "sql_answer". These are simple aggregations, never "statistical".
 
-3. "list all unique X", "what are the distinct X", "most common X",
-   "how many unique X", "what values exist in X", "possible values for X"
-   WITH NO CONDITION ATTACHED
-   → ALWAYS "metadata".
+3. "what columns", "list all unique X", "what are the distinct X",
+   "list distinct X", "what are the possible X" — ONLY when:
+   (a) asking about schema/structure OR enumerating ALL values of a column,
+   (b) NO condition, filter, ranking, limit, or comparison is attached, AND
+   (c) zero computation is needed (no COUNT, no ORDER BY, no aggregation).
+   → ALWAYS "metadata" when all three hold.
+   → "most common X", "how many unique X", "how many distinct X",
+     "top N popular X", "which X appears most" are NEVER metadata —
+     they need aggregation. Route those to sql_answer.
 
 4. "list unique X who/where/with/that/above/below [condition]"
    → ALWAYS "sql_answer". The condition makes it a data retrieval, not metadata.
@@ -303,8 +320,10 @@ CRITICAL ROUTING RULES — NEVER VIOLATE THESE:
    narrative questions are part of the same "statistical" label as rule 5.
 
 7. "what columns", "show schema", "data types", "describe table",
-   "table structure", "field names"
-   → ALWAYS "metadata".
+   "table structure", "field names" — pure structural questions with
+   no computation needed → ALWAYS "metadata".
+   Everything else that sounds like metadata but needs a COUNT, ORDER BY,
+   ranking, or filter → ALWAYS "sql_answer".
 
 8. NEVER use route labels other than the four valid values above.
    Do NOT output "reasoning", "analytical", "lookup", "record_lookup",

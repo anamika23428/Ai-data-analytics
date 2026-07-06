@@ -193,39 +193,33 @@ _NO_FILTER = (
 
 # ── Route C: Metadata (pure structural enumeration, NO conditions) ────────────
 _METADATA_PATTERNS = [
-    # Pure schema/structure questions — these never have conditionals
-    r"\bwhat\s+columns\b",
-    r"\bcolumn\s+names\b",
-    r"\blist\s+(the\s+)?columns\b",
-    r"\bshow\s+(me\s+)?(the\s+)?columns\b",
-    r"\bdata\s+types?\b",
-    r"\bschema\b",
-    r"\bdescribe\s+the\s+(table|dataset|data)\b",
-    r"\btable\s+structure\b",
-    r"\bhow\s+many\s+columns\b",
-    r"\bwhat\s+tables\b",
-    r"\bfield\s+names\b",
-    r"\bstructure\s+of\s+(the\s+)?(data|table|dataset)\b",
-    r"\bshow\s+(me\s+)?(the\s+)?schema\b",
-    r"\bwhat\s+fields\b",
-    # Unique/distinct value listing — ONLY when no conditional clause follows.
-    rf"\blist\s+(all\s+)?(unique|distinct)\b{_NO_FILTER}",
-    rf"\bwhat\s+are\s+the\s+(unique|distinct|possible|available|different)\b{_NO_FILTER}",
-    rf"\bunique\s+values?\s+(in|of|for)\b{_NO_FILTER}",
-    rf"\bdistinct\s+values?\s+(in|of|for)\b{_NO_FILTER}",
-    rf"\bshow\s+(all\s+)?(unique|distinct)\b{_NO_FILTER}",
-    rf"\bpossible\s+values?\b{_NO_FILTER}",
-    rf"\bavailable\s+values?\b{_NO_FILTER}",
-    rf"\bwhat\s+values?\s+(exist|are\s+there|does\s+.+\s+have)\b{_NO_FILTER}",
-    rf"\bwhat\s+(categories|types?|kinds?|options?|statuses?|labels?)\s+(exist|are\s+(there|available|present|in))\b{_NO_FILTER}",
-    rf"\bhow\s+many\s+(unique|distinct)\b{_NO_FILTER}",
-    r"\ball\s+(unique|distinct)\s+\w+\s*$",  # Inherently safe at the end of prompt
-    # Most/least common — only unconditional forms
-    rf"\bmost\s+common\b{_NO_FILTER}",
-    rf"\bleast\s+common\b{_NO_FILTER}",
-    rf"\bmost\s+frequent\b{_NO_FILTER}",
-    rf"\bleast\s+frequent\b{_NO_FILTER}",
-    rf"\btop\s+\d+\s+(most\s+)?(common|frequent|popular)\b{_NO_FILTER}",
+    # ── Schema / structure — unambiguously structural, never need SQL ──────
+    r"\\bwhat\\s+columns\\b",
+    r"\\bcolumn\\s+names\\b",
+    r"\\blist\\s+(the\\s+)?columns\\b",
+    r"\\bshow\\s+(me\\s+)?(the\\s+)?columns\\b",
+    r"\\bdata\\s+types?\\b",
+    r"\\bschema\\b",
+    r"\\bdescribe\\s+the\\s+(table|dataset|data)\\b",
+    r"\\btable\\s+structure\\b",
+    r"\\bhow\\s+many\\s+columns\\b",
+    r"\\bwhat\\s+tables\\b",
+    r"\\bfield\\s+names\\b",
+    r"\\bstructure\\s+of\\s+(the\\s+)?(data|table|dataset)\\b",
+    r"\\bshow\\s+(me\\s+)?(the\\s+)?schema\\b",
+    r"\\bwhat\\s+fields\\b",
+    # ── Strict unconditional unique/distinct enumeration only ────────────
+    # These require NO condition after them (_NO_FILTER enforces this).
+    # "most/least common/frequent" and "top N popular" are removed —
+    # those are ranked aggregations (Route B), not structural enumeration.
+    rf"\\blist\\s+(all\\s+)?(unique|distinct)\\b{_NO_FILTER}",
+    rf"\\bwhat\\s+are\\s+the\\s+(unique|distinct|possible|different)\\b{_NO_FILTER}",
+    rf"\\bunique\\s+values?\\s+(in|of|for)\\b{_NO_FILTER}",
+    rf"\\bdistinct\\s+values?\\s+(in|of|for)\\b{_NO_FILTER}",
+    rf"\\bshow\\s+(all\\s+)?(unique|distinct)\\b{_NO_FILTER}",
+    rf"\\bwhat\\s+(categories|types?|statuses?|options?)\\s+(exist|are\\s+(there|available|in))\\b{_NO_FILTER}",
+    rf"\\bhow\\s+many\\s+(unique|distinct)\\b{_NO_FILTER}",
+    r"\\ball\\s+(unique|distinct)\\s+\\w+\\s*$",
 ]
 # ── Route D: Statistical (complex analytics only) ─────────────────────────────
 _STATISTICAL_PATTERNS = [
