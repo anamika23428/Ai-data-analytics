@@ -821,6 +821,45 @@ def _execute_sql(conn, sql: str) -> pd.DataFrame:
 #  Layer 5 – Visualization Builder
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _resolve_names_values(df: pd.DataFrame, x_col: str | None, y_col: str | None):
+    """
+    Pick a (categorical 'names', numeric 'values') pair for part-to-whole
+    charts (pie/donut/funnel/treemap).
+
+    Unlike bar/line charts, these chart types are NOT symmetric in x/y — the
+    "names"/category axis must be categorical (or at least non-numeric-ish)
+    and the "values" axis must be numeric, or the chart renders as empty
+    (e.g. Plotly can't sum text into pie slices). The generic x/y inference
+    upstream assigns numeric → x and categorical → y, which is backwards for
+    these chart types, so we re-derive the correct assignment here from the
+    actual column dtypes rather than trusting x_col/y_col order blindly.
+    """
+    num_cols = list(df.select_dtypes(include="number").columns)
+    cat_cols = [c for c in df.columns if c not in num_cols]
+
+    def is_num(col):
+        return col is not None and col in num_cols
+
+    if x_col and y_col:
+        x_num, y_num = is_num(x_col), is_num(y_col)
+        if x_num and not y_num:
+            return y_col, x_col          # x is the numeric value, y is the category
+        if y_num and not x_num:
+            return x_col, y_col          # already correct
+        if x_num and y_num:
+            # both numeric — no clear category; fall back to df order
+            return (x_col, y_col) if list(df.columns).index(x_col) < list(df.columns).index(y_col) else (y_col, x_col)
+        # neither numeric — no clear value column; can't build a real chart
+        return x_col, y_col
+
+    # One or both missing — infer straight from dtypes.
+    names_col = cat_cols[0] if cat_cols else (df.columns[0] if len(df.columns) >= 1 else None)
+    values_col = next((c for c in num_cols if c != names_col), None)
+    if values_col is None:
+        values_col = next((c for c in df.columns if c != names_col), None)
+    return names_col, values_col
+
+
 def _build_chart(df: pd.DataFrame, intent: dict) -> go.Figure:
     """
     Build a Plotly figure from the result DataFrame + intent spec.
@@ -905,12 +944,37 @@ def _build_chart(df: pd.DataFrame, intent: dict) -> go.Figure:
                 )
 
         elif chart_type in ("pie", "donut"):
-            names_col  = x_col or (df.columns[0] if len(df.columns) >= 1 else None)
-            values_col = y_col or (df.columns[1] if len(df.columns) >= 2 else None)
+            names_col, values_col = _resolve_names_values(df, x_col, y_col)
             if names_col and values_col:
+                # Collapse duplicate categories (sum) so slices aren't split/hidden,
+                # and drop non-positive values, which px.pie renders as invisible slivers.
+                pie_df = (
+                    df[[names_col, values_col]]
+                    .groupby(names_col, as_index=False)[values_col]
+                    .sum()
+                )
+                pie_df = pie_df[pie_df[values_col] > 0]
+                if pie_df.empty:
+                    raise ValueError(
+                        "The pie/donut chart has no positive values to plot after aggregation. "
+                        "Please rephrase your question or check that the value column is numeric."
+                    )
+                pie_df = pie_df.sort_values(values_col, ascending=False)
+
                 fig = px.pie(
-                    df, names=names_col, values=values_col, title=title,
+                    pie_df, names=names_col, values=values_col, title=title,
                     hole=0.45 if chart_type == "donut" else 0.0,
+                )
+                fig.update_traces(
+                    textposition="inside",
+                    textinfo="percent+label",
+                    hovertemplate="%{label}: %{value} (%{percent})<extra></extra>",
+                    marker=dict(line=dict(color="rgba(255,255,255,0.6)", width=1)),
+                )
+                fig.update_layout(
+                    legend=dict(orientation="v", yanchor="middle", y=0.5, x=1.05),
+                    uniformtext_minsize=11,
+                    uniformtext_mode="hide",
                 )
             else:
                 raise ValueError(
@@ -1051,8 +1115,7 @@ def _build_chart(df: pd.DataFrame, intent: dict) -> go.Figure:
                 )
 
         elif chart_type == "funnel":
-            names_col  = x_col or (df.columns[0] if len(df.columns) >= 1 else None)
-            values_col = y_col or (df.columns[1] if len(df.columns) >= 2 else None)
+            names_col, values_col = _resolve_names_values(df, x_col, y_col)
             if names_col and values_col:
                 fig = px.funnel(df, x=values_col, y=names_col, title=title)
             else:
@@ -1062,8 +1125,7 @@ def _build_chart(df: pd.DataFrame, intent: dict) -> go.Figure:
                 )
 
         elif chart_type == "treemap":
-            path_col   = x_col or (df.columns[0] if len(df.columns) >= 1 else None)
-            values_col = y_col or (df.columns[1] if len(df.columns) >= 2 else None)
+            path_col, values_col = _resolve_names_values(df, x_col, y_col)
             if path_col and values_col:
                 fig = px.treemap(
                     df, path=[path_col], values=values_col, title=title,

@@ -169,6 +169,7 @@ ROUTE DEFINITIONS — choose the single best fit:
 → Use ONLY when the user specifically asks to SEE something visually.
 → Do NOT use just because aggregation or math is involved.
 Examples:
+  "plot a chart "
   "bar chart of sales by category"
   "pie chart of orders by city"
   "plot revenue over time"

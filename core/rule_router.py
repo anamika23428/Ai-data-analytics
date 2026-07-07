@@ -45,6 +45,8 @@ import re
 
 # ── Route A: Visualization ────────────────────────────────────────────────────
 _VISUALIZATION_PATTERNS = [
+    r"\bchart\s+of\b",
+    r"\bchart\s+the\b",
     r"\bbar\s*chart\b",
     r"\bpie\s*chart\b",
     r"\bline\s*chart\b",
@@ -57,8 +59,6 @@ _VISUALIZATION_PATTERNS = [
     r"\bplot\s+(the|a|my|me)\b",
     r"\bgraph\s+(the|a|my|me)\b",
     r"\bvisuali[sz]e\b",
-    r"\bchart\s+of\b",
-    r"\bchart\s+the\b",
     r"\bshow\s+(me\s+)?a\s+(chart|graph|plot)\b",
     r"\bcreate\s+(a\s+)?(chart|graph|plot|visual)\b",
     r"\bdraw\s+(a\s+)?(chart|graph|plot)\b",
