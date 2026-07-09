@@ -389,6 +389,7 @@ def _call_ollama_sync(messages: list[dict]) -> dict:
         "options": {
             "temperature": 0.0,
             "num_predict": 256,
+            "num_ctx":     4096,   # prevents mid-JSON truncation on large schemas
         },
     }
     try:
@@ -543,7 +544,48 @@ def route_query(
     try:
         raw_response = _call_ollama_sync(messages)
         raw_text     = raw_response["message"]["content"]
-        parsed       = _parse_json_safe(raw_text)
+
+        try:
+            parsed = _parse_json_safe(raw_text)
+        except ValueError:
+            # JSON was unparseable or truncated — the model likely answered the
+            # question directly or returned a malformed structure. Attempt the
+            # same structure-correction retry used for wrong-key JSON.
+            logger.warning(
+                "LLM returned unparseable/truncated JSON — attempting "
+                "structure-correction retry."
+            )
+            correction_messages = messages + [
+                {"role": "assistant", "content": raw_text},
+                {
+                    "role": "user",
+                    "content": (
+                        "Your previous response was not valid JSON or had the wrong "
+                        "structure. I need ONLY a routing decision JSON with exactly "
+                        "these keys: route, confidence, chart_type, x_axis, y_axis, "
+                        "aggregation, title, explanation. "
+                        "Do NOT include any data rows, SQL queries, or query plans. "
+                        "Do NOT answer the user's question. "
+                        "Output ONLY the routing JSON object, nothing else."
+                    ),
+                },
+            ]
+            try:
+                retry_response = _call_ollama_sync(correction_messages)
+                retry_text     = retry_response["message"]["content"]
+                parsed         = _parse_json_safe(retry_text)
+                logger.info("Structure-correction retry succeeded after parse failure.")
+            except Exception as retry_exc:
+                logger.warning(
+                    "Structure-correction retry also failed: %s — "
+                    "falling back to sql_answer.", retry_exc
+                )
+                parsed = {
+                    "route": "sql_answer", "confidence": "LOW",
+                    "chart_type": None, "x_axis": None, "y_axis": None,
+                    "aggregation": "none", "title": "",
+                    "explanation": "Router fell back after returning unparseable JSON.",
+                }
 
         # ── Validate structure — the model sometimes answers the question
         # directly instead of returning a routing decision. Detect this by
