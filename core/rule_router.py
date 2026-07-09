@@ -45,25 +45,39 @@ import re
 
 # ── Route A: Visualization ────────────────────────────────────────────────────
 _VISUALIZATION_PATTERNS = [
-    r"\bchart\s+of\b",
-    r"\bchart\s+the\b",
-    r"\bbar\s*chart\b",
-    r"\bpie\s*chart\b",
-    r"\bline\s*chart\b",
-    r"\bline\s*graph\b",
+    # --- Generic action verbs + target ---
+    r"\b(plot|graph|chart)\s+(the|a|an|my|me|this|these|out)\b",
+    r"\b(visuali[sz]e|visuali[sz]ation)\b",
+    r"\b(show|display|render)\s+(me\s+)?(a\s+|the\s+)?(chart|graph|plot|visual(?:ization)?|diagram)\b",
+    r"\b(create|make|build|generate|draw|produce)\s+(a\s+|an\s+|the\s+)?(chart|graph|plot|visual(?:ization)?|diagram|dashboard)\b",
+    r"\bturn\s+(this|these|it)\s+into\s+a\s+(chart|graph|plot|visual)\b",
+    r"\b(chart|graph|plot)\s+(of|for|showing|comparing|depicting)\b",
+    r"\bdata\s*viz\b",
+
+    # --- -ing forms (often missed) ---
+    r"\b(plotting|graphing|charting|visuali[sz]ing)\b",
+
+    # --- Explicit chart types (generic + specific) ---
+    r"\b(bar|pie|line|scatter|heat|area|donut|doughnut|bubble|radar|"
+    r"waterfall|gauge|funnel|treemap|box(?:[\s-]?and[\s-]?whisker)?|"
+    r"candlestick|sankey|stacked\s*bar|stacked\s*area|grouped\s*bar)\s*"
+    r"(chart|graph|plot|map|diagram)\b",
+    r"\bhistogram\b",
     r"\bscatter\s*plot\b",
     r"\bheat\s*map\b",
-    r"\bbar\s*graph\b",
-    r"\bpie\s*graph\b",
-    r"\bhistogram\b",
-    r"\bplot\s+(the|a|my|me)\b",
-    r"\bgraph\s+(the|a|my|me)\b",
-    r"\bvisuali[sz]e\b",
-    r"\bshow\s+(me\s+)?a\s+(chart|graph|plot)\b",
-    r"\bcreate\s+(a\s+)?(chart|graph|plot|visual)\b",
-    r"\bdraw\s+(a\s+)?(chart|graph|plot)\b",
-]
+    r"\bbox\s*plot\b",
 
+    # --- Trend / distribution / comparison phrasing (implicit chart requests) ---
+    r"\btrend(s)?\s+(over\s+time|by|across|per)\b",
+    r"\b(distribution|breakdown|split)\s+(of|by|across)\b",
+    r"\bcompare\s+.+\s+(vs\.?|versus|against|and)\s+.+\b",
+    r"\b(month|quarter|year|day|week)[\s-]over[\s-](month|quarter|year|day|week)\b",
+    r"\b(top\s+\d+|ranking)\s+.+\s+by\b",
+
+    # --- Table/summary-as-visual requests (borderline but common) ---
+    r"\bvisual\s+(summary|comparison|breakdown)\b",
+    r"\b(pivot|summary)\s+chart\b",
+]
 # ── Route B: SQL Answer (row retrieval + simple aggregation) ──────────────────
 _SQL_ANSWER_PATTERNS = [
     # ── Row retrieval ──────────────────────────────────────────────────────────
