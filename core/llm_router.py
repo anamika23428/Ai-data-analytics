@@ -389,7 +389,7 @@ def _call_ollama_sync(messages: list[dict]) -> dict:
         "options": {
             "temperature": 0.0,
             "num_predict": 256,
-            "num_ctx":     4096,   # prevents mid-JSON truncation on large schemas
+            "num_ctx":     4096,
         },
     }
     try:
@@ -435,6 +435,23 @@ def _parse_json_safe(text: str) -> dict:
     )
 
 
+# ── Shared sql_answer fallback dict ──────────────────────────────────────────
+# Used by every fallback path so the structure is consistent and only
+# defined once. Stage and explanation are filled in at each call site.
+
+def _sql_answer_fallback(explanation: str) -> dict:
+    return {
+        "route":       "sql_answer",
+        "confidence":  "LOW",
+        "chart_type":  None,
+        "x_axis":      None,
+        "y_axis":      None,
+        "aggregation": "none",
+        "title":       "",
+        "explanation": explanation,
+    }
+
+
 # ── Public entry point ────────────────────────────────────────────────────────
 
 def route_query(
@@ -449,17 +466,16 @@ def route_query(
     Route a user query using a rule-based pre-filter first, falling back
     to the local Ollama LLM only when the rule filter is ambiguous.
 
-    Args:
-        user_prompt:       The user's natural language question.
-        ddl_schema:        Privacy-safe DDL string (schema only, no row data).
-        table_name:        Comma-separated names of all loaded tables.
-        sample_rows:       Optional first-3 rows for LLM context.
-        print_to_terminal: If True, pretty-prints the decision to stdout.
-        known_columns:     Lowercased column names across all tables, used to
-                           sharpen the grouped-aggregation pattern check.
+    Every possible failure path — connectivity errors, timeouts, truncated
+    JSON, wrong JSON structure, invalid route label — now returns
+    success=True with route="sql_answer" rather than success=False.
+    This ensures the query always executes via the most general route
+    instead of surfacing a hard router failure to the user.
 
-    Returns dict with keys:
-        success, stage, parsed (route/confidence/chart_type/…), model, error
+    The stage key distinguishes how the result was reached:
+      "rule"         — deterministic rule match, no LLM call
+      "llm"          — LLM returned a valid routing decision
+      "llm_fallback" — LLM failed at some point, fell back to sql_answer
     """
     # ── Stage 1: Rule-based filter (zero cost, ~1ms) ──────────────────────────
     rule_result = rule_classify(user_prompt, known_columns=known_columns)
@@ -497,16 +513,6 @@ def route_query(
             f"fits — in that case choose whichever route is correct.\n"
         )
     else:
-        # Zero rule matches: the keyword scan found NO obvious signal for any
-        # route. This does NOT mean the question is ambiguous or unanswerable
-        # — it usually means the question is phrased in a way the keyword
-        # patterns didn't anticipate. Most zero-match questions turn out to
-        # be ordinary row/aggregate retrieval (sql_answer), so bias toward it
-        # — but only when there's truly no visualization, metadata, or
-        # statistical signal either. This keeps "plot it" routable as
-        # visualization and "what insights can you give me" routable as
-        # statistical, instead of forcing every zero-match case into
-        # sql_answer regardless of actual content.
         candidate_hint = (
             f"\nA preliminary rule scan found no obvious keyword match for this "
             f"question. In the absence of a clear chart/plot/visualize request, "
@@ -548,9 +554,9 @@ def route_query(
         try:
             parsed = _parse_json_safe(raw_text)
         except ValueError:
-            # JSON was unparseable or truncated — the model likely answered the
-            # question directly or returned a malformed structure. Attempt the
-            # same structure-correction retry used for wrong-key JSON.
+            # JSON was unparseable or truncated — the model likely answered
+            # the question directly or returned a malformed/truncated structure.
+            # Attempt a structure-correction retry before falling back.
             logger.warning(
                 "LLM returned unparseable/truncated JSON — attempting "
                 "structure-correction retry."
@@ -580,24 +586,20 @@ def route_query(
                     "Structure-correction retry also failed: %s — "
                     "falling back to sql_answer.", retry_exc
                 )
-                parsed = {
-                    "route": "sql_answer", "confidence": "LOW",
-                    "chart_type": None, "x_axis": None, "y_axis": None,
-                    "aggregation": "none", "title": "",
-                    "explanation": "Router fell back after returning unparseable JSON.",
-                }
+                parsed = _sql_answer_fallback(
+                    "Router fell back after returning unparseable JSON."
+                )
 
         # ── Validate structure — the model sometimes answers the question
         # directly instead of returning a routing decision. Detect this by
         # checking for the required "route" key and retry once with a stricter
-        # prompt if it's missing. ──────────────────────────────────────────────
+        # prompt if it's missing.
         if "route" not in parsed:
             logger.warning(
                 "LLM returned valid JSON but wrong structure (no 'route' key) — "
                 "model answered the question instead of routing it. Retrying with "
                 "stricter prompt."
             )
-            # Inject a correction turn into the conversation
             correction_messages = messages + [
                 {"role": "assistant", "content": raw_text},
                 {
@@ -623,20 +625,14 @@ def route_query(
                         "Structure-correction retry also returned wrong structure — "
                         "falling back to sql_answer."
                     )
-                    parsed = {
-                        "route": "sql_answer", "confidence": "LOW",
-                        "chart_type": None, "x_axis": None, "y_axis": None,
-                        "aggregation": "none", "title": "",
-                        "explanation": "Router fell back after returning wrong JSON structure.",
-                    }
+                    parsed = _sql_answer_fallback(
+                        "Router fell back after returning wrong JSON structure."
+                    )
             except Exception as retry_exc:
                 logger.warning("Structure-correction retry failed: %s", retry_exc)
-                parsed = {
-                    "route": "sql_answer", "confidence": "LOW",
-                    "chart_type": None, "x_axis": None, "y_axis": None,
-                    "aggregation": "none", "title": "",
-                    "explanation": "Router fell back after returning wrong JSON structure.",
-                }
+                parsed = _sql_answer_fallback(
+                    "Router fell back after returning wrong JSON structure."
+                )
 
         parsed["confidence"] = str(parsed.get("confidence", "MEDIUM")).upper()
         if parsed["confidence"] not in ("HIGH", "MEDIUM", "LOW"):
@@ -649,8 +645,9 @@ def route_query(
                 "LLM returned invalid route '%s' — falling back to sql_answer",
                 parsed.get("route"),
             )
-            parsed["route"]      = "sql_answer"
-            parsed["confidence"] = "LOW"
+            parsed = _sql_answer_fallback(
+                f"Router fell back: invalid route label '{parsed.get('route')}'."
+            )
 
         result = {
             "success":      True,
@@ -665,21 +662,47 @@ def route_query(
         return result
 
     except (ConnectionError, TimeoutError) as exc:
+        # Ollama unreachable or timed out before any response was received.
+        # Return sql_answer fallback so the query still executes rather than
+        # surfacing a hard router failure to the user.
         msg = str(exc)
-        logger.error(msg)
+        logger.error(
+            "Router connectivity/timeout error — falling back to sql_answer: %s", msg
+        )
+        parsed = _sql_answer_fallback(
+            "Router fell back to sql_answer after a connectivity/timeout error."
+        )
         result = {
-            "success": False, "stage": "llm", "parsed": None,
-            "model": ROUTER_MODEL, "error": msg, "user_message": user_message,
+            "success":      True,
+            "stage":        "llm_fallback",
+            "parsed":       parsed,
+            "model":        ROUTER_MODEL,
+            "error":        None,
+            "user_message": user_message,
+            "warning":      msg,
         }
         if print_to_terminal:
             _print_route(result)
         return result
 
     except Exception as exc:
-        logger.error("LLM routing failed: %s", exc, exc_info=True)
+        # Any other unexpected failure (HTTP 500, JSON at top level, etc.).
+        # Same strategy: fall back to sql_answer rather than blocking execution.
+        msg = str(exc)
+        logger.error(
+            "LLM routing failed — falling back to sql_answer: %s", exc, exc_info=True
+        )
+        parsed = _sql_answer_fallback(
+            "Router fell back to sql_answer after an unexpected error."
+        )
         result = {
-            "success": False, "stage": "llm", "parsed": None,
-            "model": ROUTER_MODEL, "error": str(exc), "user_message": user_message,
+            "success":      True,
+            "stage":        "llm_fallback",
+            "parsed":       parsed,
+            "model":        ROUTER_MODEL,
+            "error":        None,
+            "user_message": user_message,
+            "warning":      msg,
         }
         if print_to_terminal:
             _print_route(result)
