@@ -1,3 +1,10 @@
+import os
+# Force the base theme to light mode
+os.environ["STREAMLIT_THEME_BASE"] = "light"
+# Optional: Hardcode exact background shades if you want pure white
+os.environ["STREAMLIT_THEME_BACKGROUND_COLOR"] = "#FFFFFF"
+os.environ["STREAMLIT_THEME_SECONDARY_BACKGROUND_COLOR"] = "#F8F9FA"
+
 import sys
 from pathlib import Path
 import socket
@@ -19,6 +26,8 @@ import uuid
 import json
 import re
 import logging
+
+
 
 from config import MAX_FILE_SIZE_MB, SESSION_TTL_MINUTES, PROMPT_MAX_LENGTH, DDL_MAX_COLUMNS
 from core.validator import validate_file, validate_sql_query

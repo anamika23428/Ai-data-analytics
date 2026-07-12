@@ -3,6 +3,12 @@
 #  Change values here; nothing else needs edits.
 # ─────────────────────────────────────────────
 
+
+# Your existing app.py code continues below...
+import sys
+from pathlib import Path
+import socket
+
 # How long (in minutes) we keep a user's temp folder alive
 SESSION_TTL_MINUTES = 30
 
@@ -34,6 +40,7 @@ PROMPT_MAX_LENGTH = 2000
 # When building a DDL for the LLM, if a table has more than this many
 # columns we'll compress/summarise the schema for privacy and token cost.
 DDL_MAX_COLUMNS = 50
+
 
 # ─────────────────────────────────────────────
 #  Ollama System Settings
