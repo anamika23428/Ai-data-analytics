@@ -142,7 +142,7 @@ _SQL_ANSWER_PATTERNS = [
     # Single-value aggregations
     r"\bwhat\s+is\s+the\s+(total|sum|average|avg|mean|max|maximum|min|minimum)\b",
     r"\bwhat\s+(is|are)\s+the\s+(highest|lowest|most|least|best|worst)\b",
-    r"\bhow\s+many\s+(?!unique\b|distinct\b)\w",
+    r"\bhow\s+many\s+(?!unique\b|distinct\b|columns\b|fields\b|tables\b)\w",
     r"\bhow\s+much\s+(total\s+)?(revenue|sales?|profit|spend|cost|amount)\b",
     r"\bcount\s+(of\s+)?(all\s+)?(the\s+)?(rows?|records?|orders?|customers?|users?|products?|entries|items?)\b",
 
@@ -230,8 +230,16 @@ _METADATA_PATTERNS = [
     rf"\bwhat\s+are\s+the\s+(unique|distinct|possible|different)\b{_NO_FILTER}",
     rf"\bunique\s+values?\s+(in|of|for)\b{_NO_FILTER}",
     rf"\bdistinct\s+values?\s+(in|of|for)\b{_NO_FILTER}",
-    rf"\bshow\s+(all\s+)?(unique|distinct)\b{_NO_FILTER}",
-    rf"\bwhat\s+(categories|types?|statuses?|options?)\s+(exist|are\s+(there|available|in))\b{_NO_FILTER}",
+    # Allow filler ("me", "the") between "show" and "unique/distinct" —
+    # "show me the unique work modes" previously zero-matched because the
+    
+    rf"\bshow\s+(me\s+)?(the\s+)?(all\s+)?(unique|distinct)\b{_NO_FILTER}",
+    # Category-existence: expanded noun list to cover common domain terms
+    # (roles, levels, modes) that were previously falling through to zero
+    # candidates. "categories|types?|statuses?|options?" kept from the
+    # original for backward compatibility.
+    rf"\bwhat\s+(categories|types?|statuses?|options?|roles?|levels?|modes?)\s+"
+    rf"(exist|are\s+(there|available|in))\b{_NO_FILTER}",
     rf"\bhow\s+many\s+(unique|distinct)\b{_NO_FILTER}",
     r"\ball\s+(unique|distinct)\s+\w+\s*$",
 ]
